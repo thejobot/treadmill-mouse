@@ -34,8 +34,23 @@ configuration page, and the test tools.
 
 ## What you need
 
-A Raspberry Pi Pico 2 W (about $7), a USB cable, and a Bluetooth controller.
-No soldering, no case required, no other parts.
+A Raspberry Pi Pico 2 W (about $7 at list), a USB cable, and a Bluetooth
+controller. No soldering, and nothing else is required.
+
+The parts this was built with:
+
+- [Raspberry Pi Pico 2 W with pre-soldered headers](https://www.amazon.com/dp/B0DPCGQPW3),
+  which comes with a USB cable. The headers are not used for anything here —
+  that bundle was just the convenient way to buy the board.
+- [C4Labs Zebra case for the Pico W / Pico 2 / Pico 2 W](https://www.amazon.com/dp/B08X24QJZC),
+  optional, but a bare board living in a USB port is a bare board getting
+  knocked about.
+
+Any Pico 2 W works, and it has to be one of the wireless boards — the radio is
+the whole point. The published `.uf2` is built for the Pico 2 W, so that is the
+board to buy. Upstream also builds this app for the original Pico W and for the
+Waveshare RP2350B-Plus-W, but neither has been tried here, and each needs its
+own build.
 
 ## Controllers it works with
 
