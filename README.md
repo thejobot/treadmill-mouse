@@ -37,9 +37,38 @@ configuration page, and the test tools.
 A Raspberry Pi Pico 2 W (about $7), a USB cable, and a Bluetooth controller.
 No soldering, no case required, no other parts.
 
-Tested with a PlayStation DualSense. joypad-os supports a long list of other
-pads over Bluetooth; a first-generation Joy-Con is wired up here too but has
-never been tested against real hardware. See [docs/JOYCON.md](docs/JOYCON.md).
+## Controllers it works with
+
+The mouse layer sits above the Bluetooth drivers. It reads the normalised input
+event, not any particular pad's report, so anything joypad-os can talk to can
+drive the cursor.
+
+| | |
+|---|---|
+| Sony | DualShock 3, DualShock 4, DualSense |
+| Nintendo | Switch Pro and first-generation Joy-Con over Classic; Switch 2, Joy-Con 2 and the GameCube NSO pad over BLE; Wii U Pro; Wiimote |
+| Google | Stadia |
+| Microsoft | every Xbox variant, through the generic driver |
+| Augmental | MouthPad, a mouth-operated BLE pointing device |
+| Anything else | any standard Bluetooth HID gamepad, through the generic driver |
+
+Xbox pads deliberately have no dedicated driver. The generic driver reads the
+HID descriptor and works out the layout from it, the way BlueRetro does, which
+covers every variant without anyone having to guess at a report format.
+
+**Only the DualSense has actually been tested.** That table is a list of drivers
+compiled into the build, not a list of things known to work. A first-generation
+Joy-Con is wired up for motion here too and has never met real hardware — see
+[docs/JOYCON.md](docs/JOYCON.md).
+
+Two features are narrower than the table. The touchpad needs a pad that has one,
+so DualShock 4 or DualSense. The gyro needs an inertial sensor: DualShock 4 and
+DualSense, the DualShock 3 on one axis only, and Joy-Con through the patch in
+this repo. The buzz that confirms a chord needs a pad with rumble.
+
+Valve's Steam Controller and the iPega PG-9021 landed upstream after the commit
+this is pinned to, so they are not in the published build. Moving the pin in
+`setup.sh` picks them up.
 
 ## Getting it running
 
@@ -153,6 +182,37 @@ least one to need flipping; there are invert switches for exactly that.
 with no controller attached at all, by driving the report path from firmware.
 It is macOS-only, because it reads Quartz event counters to confirm what
 arrived.
+
+## What you could mod it into
+
+The scope here is deliberate. Mouse and nothing else is not a limitation that
+ran out of time — it is the property the whole thing rests on, and every
+tempting addition costs it.
+
+Keyboard shortcuts are the obvious next surface, and they are the one thing that
+would undo this. The firmware currently never writes a keystroke, but that is
+behaviour; what a host inspects is identity. Declare a keyboard interface and
+endpoint security sees a keyboard on a machine you do not administer, and macOS
+opens Keyboard Setup Assistant asking for a key that does not exist. The
+mouse-only identity above exists precisely to stop declaring one. If you do not
+care about locked-down machines, the mapping table is the place to start: the
+action enum in `kbmouse.h` has fourteen values and all of them are pointer
+actions, so adding a keycode type is a day's work, not an architecture change.
+
+Siri, Spotlight and media keys are the interesting middle case. They are
+consumer-control usages, a different HID collection from a keyboard, so they may
+not carry the same cost. Nobody has tested that. Two things would need
+answering: whether macOS actually maps any consumer usage to Siri or Spotlight,
+and whether declaring a second collection re-triggers the host behaviour the
+mouse-only identity was built to avoid. Both are answerable in an afternoon with
+the board in hand.
+
+Screen zoom and desktop gestures were considered and rejected outright. Both
+need keyboard output, and both need per-machine settings that do not travel with
+the dongle, which is the opposite of what this is for.
+
+Everything else is open. The mapping table, the presets, the chord handler and
+the serial command set are all small and all in `overlay/`.
 
 ## Building it
 
