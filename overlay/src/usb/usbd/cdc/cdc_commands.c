@@ -1,0 +1,4511 @@
+// cdc_commands.c - CDC command handlers
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024 Robert Dale Smith
+
+#include "cdc_commands.h"
+#include "cdc_protocol.h"
+#include "../usbd.h"
+#include "app.h"
+#include "fw_rev.h"
+#include "core/app_registry.h"
+#include "core/router/router.h"
+#include "core/services/storage/flash.h"
+#include "core/services/leds/neopixel/ws2812.h"
+#include "core/services/profiles/profile.h"
+#include "core/services/players/manager.h"
+#include "core/services/players/feedback.h"
+#include "usb/usbd/kbmouse/kbmouse.h"
+#include "usb/usbd/kbmouse/kbm_presets.h"
+#include "platform/platform.h"
+#if !defined(PLATFORM_ESP32) && !defined(PLATFORM_NRF) && !defined(PLATFORM_CH32)
+#include "pico/stdio.h"
+#include "pico/stdio/driver.h"
+#endif
+#include "tusb.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+// Optional pad config support (controller apps)
+#ifdef CONFIG_PAD_INPUT
+#include "pad/pad_input.h"
+#include "pad/pad_config_flash.h"
+#endif
+
+// Optional BT support
+#ifdef ENABLE_BTSTACK
+#include "bt/btstack/btstack_host.h"
+#include "bt/bthid/devices/vendors/nintendo/wiimote_bt.h"
+#endif
+
+// Optional BLE output support
+#if REQUIRE_BLE_OUTPUT
+#include "bt/ble_output/ble_output.h"
+#endif
+
+// PS4 auth flash storage (always compiled with USB device sources)
+#include "core/services/storage/ps4_auth_flash.h"
+// PS4 local RSA signing (requires pico_mbedtls — enabled by ENABLE_PS4_LOCAL_AUTH)
+#ifdef ENABLE_PS4_LOCAL_AUTH
+#include "usb/usbd/modes/ps4_local_auth.h"
+#endif
+
+// ============================================================================
+// STATE
+// ============================================================================
+
+static cdc_protocol_t protocol_ctx;
+static cdc_protocol_t *active_ctx = &protocol_ctx;  // Swappable for NUS bridge
+static cdc_protocol_t *stream_ctx = NULL;            // Context with input/log streaming enabled
+static char response_buf[CDC_MAX_PAYLOAD];
+
+// Deferred reboot flags — set by command handlers, executed in cdc_commands_task()
+// to avoid nested tud_task() calls inside protocol handlers (breaks ESP32 FreeRTOS)
+#define PENDING_NONE    0
+#define PENDING_REBOOT  1
+#define PENDING_BOOTSEL 2
+#define PENDING_OTA     3
+static volatile uint8_t pending_reboot = PENDING_NONE;
+static uint32_t pending_reboot_time = 0;
+
+// ============================================================================
+// LOG CAPTURE (ring buffer + stdio driver)
+// ============================================================================
+
+#define LOG_BUF_SIZE 4096
+static char log_ring[LOG_BUF_SIZE];
+static volatile uint16_t log_head = 0;  // Write position
+static volatile uint16_t log_tail = 0;  // Read position (streaming)
+
+// LOG.DUMP state: separate read position so dump doesn't interfere with streaming
+static volatile uint16_t dump_pos = 0;
+static volatile uint16_t dump_end = 0;
+static volatile bool     dump_active = false;
+
+static void log_stdio_out_chars(const char *buf, int len)
+{
+    // Always capture — ring buffer is active from startup regardless of streaming state
+    for (int i = 0; i < len; i++) {
+        uint16_t next = (log_head + 1) % LOG_BUF_SIZE;
+        if (next == log_tail) {
+            // Buffer full - advance tail (drop oldest byte) to make room
+            log_tail = (log_tail + 1) % LOG_BUF_SIZE;
+        }
+        log_ring[log_head] = buf[i];
+        log_head = next;
+    }
+}
+
+#if defined(PLATFORM_ESP32) || defined(PLATFORM_NRF) || defined(PLATFORM_CH32)
+// ESP32/nRF: capture printf by replacing stdout with a custom FILE* (funopen)
+// that feeds output into the ring buffer AND writes to the original output.
+static FILE *platform_orig_stdout = NULL;
+
+static int platform_log_writefn(void *cookie, const char *buf, int len)
+{
+    (void)cookie;
+    log_stdio_out_chars(buf, len);
+    if (platform_orig_stdout) {
+        fwrite(buf, 1, len, platform_orig_stdout);
+    }
+    return len;
+}
+#else
+static stdio_driver_t log_stdio_driver = {
+    .out_chars = log_stdio_out_chars,
+    .out_flush = NULL,
+    .in_chars = NULL,
+    .set_chars_available_callback = NULL,
+    .next = NULL,
+#if PICO_STDIO_ENABLE_CRLF_SUPPORT
+    .crlf_enabled = PICO_STDIO_DEFAULT_CRLF,
+#endif
+};
+#endif
+
+// Separate buffer for log events (not shared with response_buf)
+static char log_event_buf[384];
+
+// App info (set by CMake or use defaults)
+#ifndef APP_NAME
+#define APP_NAME "joypad"
+#endif
+#ifndef JOYPAD_VERSION
+#define JOYPAD_VERSION "0.0.0"
+#endif
+#ifndef GIT_COMMIT
+#define GIT_COMMIT "unknown"
+#endif
+#ifndef BUILD_TIME
+#define BUILD_TIME "unknown"
+#endif
+#ifndef BOARD_NAME
+#define BOARD_NAME "unknown"
+#endif
+
+// ============================================================================
+// JSON HELPERS
+// ============================================================================
+
+// Simple JSON string extractor: finds "key":"value" and returns value
+// Returns NULL if not found, or pointer to value (not null-terminated)
+static const char* json_get_string(const char* json, const char* key,
+                                   int* out_len)
+{
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":\"", key);
+
+    const char* start = strstr(json, search);
+    if (!start) return NULL;
+
+    start += strlen(search);
+    const char* end = strchr(start, '"');
+    if (!end) return NULL;
+
+    if (out_len) *out_len = end - start;
+    return start;
+}
+
+// Simple JSON integer extractor: finds "key":123 and returns value
+static bool json_get_int(const char* json, const char* key, int* out_val)
+{
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+
+    const char* start = strstr(json, search);
+    if (!start) return false;
+
+    start += strlen(search);
+    // Skip whitespace
+    while (*start == ' ' || *start == '\t') start++;
+
+    if (*start == '-' || (*start >= '0' && *start <= '9')) {
+        *out_val = atoi(start);
+        return true;
+    }
+    return false;
+}
+
+// Simple JSON bool extractor
+static bool json_get_bool(const char* json, const char* key, bool* out_val)
+{
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+
+    const char* start = strstr(json, search);
+    if (!start) return false;
+
+    start += strlen(search);
+    while (*start == ' ' || *start == '\t') start++;
+
+    if (strncmp(start, "true", 4) == 0) {
+        *out_val = true;
+        return true;
+    } else if (strncmp(start, "false", 5) == 0) {
+        *out_val = false;
+        return true;
+    }
+    return false;
+}
+
+// Extract command name from JSON
+static bool json_get_cmd(const char* json, char* cmd_buf, size_t buf_size)
+{
+    int len;
+    const char* cmd = json_get_string(json, "cmd", &len);
+    if (!cmd || len <= 0 || (size_t)len >= buf_size) return false;
+
+    memcpy(cmd_buf, cmd, len);
+    cmd_buf[len] = '\0';
+    return true;
+}
+
+// ============================================================================
+// RESPONSE HELPERS
+// ============================================================================
+
+static void send_ok(void)
+{
+    cdc_protocol_send_response(active_ctx, "{\"ok\":true}");
+}
+
+static void send_error(const char* msg)
+{
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":false,\"error\":\"%s\"}", msg);
+    cdc_protocol_send_response(active_ctx, response_buf);
+}
+
+static void send_json(const char* json)
+{
+    cdc_protocol_send_response(active_ctx, json);
+}
+
+// ============================================================================
+// COMMAND HANDLERS
+// ============================================================================
+
+// Diagnostic getter from sinput_mode.c (fwd-declared to avoid pulling the
+// SInput/tusb headers into this TU).
+extern uint32_t sinput_get_feature_count(void);
+
+static void cmd_info(const char* json)
+{
+    (void)json;
+
+    char serial[17];
+    platform_get_serial(serial, sizeof(serial));
+
+    int16_t imu_a[3] = {0}, imu_g[3] = {0};
+    char imu_str[80];
+    if (router_onboard_motion_get(imu_a, imu_g)) {
+        snprintf(imu_str, sizeof(imu_str), "[%d,%d,%d,%d,%d,%d]",
+                 imu_a[0], imu_a[1], imu_a[2], imu_g[0], imu_g[1], imu_g[2]);
+    } else {
+        snprintf(imu_str, sizeof(imu_str), "false");  // no IMU reporting
+    }
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"app\":\"%s\",\"version\":\"%s\",\"fw\":\"%s\",\"board\":\"%s\",\"serial\":\"%s\",\"commit\":\"%s\",\"build\":\"%s\""
+             ",\"reset\":\"0x%lx\",\"battery_mv\":%d,\"chg\":%d,\"imu\":%s,\"flashw\":%lu,\"featw\":%lu"
+             ",\"features\":{\"onboard_led\":%s}}"
+             ,
+             APP_NAME, JOYPAD_VERSION, FW_REV, BOARD_NAME, serial, GIT_COMMIT, BUILD_TIME,
+             (unsigned long)platform_last_reset_reason(), platform_battery_millivolts(),
+             platform_battery_charging(), imu_str, (unsigned long)flash_get_write_count(),
+             (unsigned long)sinput_get_feature_count(),
+#ifdef BTSTACK_USE_CYW43
+             "true"
+#elif defined(BOARD_LED_PIN)
+             "true"
+#else
+             "false"
+#endif
+             );
+    printf("[CDC] INFO response: %s\n", response_buf);
+    send_json(response_buf);
+}
+
+// MouthPad NUS relay loss stats. Weak default so non-relay builds link; the
+// strong version lives in mp_bridge.c (BLE+CDC builds). drops==0 over a session
+// proves zero firmware-side data loss (USB bulk is lossless; ring overflow is
+// the only drop point). high_water shows peak ring use vs ring_size.
+__attribute__((weak)) void mp_bridge_get_stats(uint32_t* f, uint32_t* d,
+                                               uint32_t* e, uint32_t* h, uint32_t* r) {
+    if (f) *f = 0; if (d) *d = 0; if (e) *e = 0; if (h) *h = 0; if (r) *r = 0;
+}
+
+static void cmd_mp_stats(const char* json)
+{
+    (void)json;
+    uint32_t frames = 0, drops = 0, efails = 0, high = 0, ring = 0;
+    mp_bridge_get_stats(&frames, &drops, &efails, &high, &ring);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"relay\":{\"frames\":%lu,\"drops\":%lu,\"encode_fails\":%lu,"
+             "\"high_water\":%lu,\"ring_size\":%lu}}",
+             (unsigned long)frames, (unsigned long)drops, (unsigned long)efails,
+             (unsigned long)high, (unsigned long)ring);
+    send_json(response_buf);
+}
+
+// MouthPad translation mode: 0=passthrough (mouse/kbd), 1=right stick, 2=left
+// stick. Weak default is a no-op for non-MouthPad builds; the MouthPad driver
+// provides the strong implementation.
+__attribute__((weak)) void mouthpad_set_translation_mode(int mode) { (void)mode; }
+__attribute__((weak)) int  mouthpad_get_translation_mode(void) { return -1; }
+
+static void cmd_mp_mode(const char* json)
+{
+    int mode = 1;
+    if (!json_get_int(json, "mode", &mode)) {
+        send_json("{\"error\":\"missing mode (0=passthrough,1=right,2=left)\"}");
+        return;
+    }
+    if (mode < 0 || mode > 2) {
+        send_json("{\"error\":\"mode out of range (0-2)\"}");
+        return;
+    }
+    mouthpad_set_translation_mode(mode);
+    int actual = mouthpad_get_translation_mode();   // read back the DRIVER's real state
+    const char* name = (actual == 0) ? "passthrough" : (actual == 2) ? "left_stick" :
+                       (actual == 1) ? "right_stick" : "no_mouthpad_driver";
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"requested\":%d,\"mp_mode\":%d,\"name\":\"%s\"}", mode, actual, name);
+    send_json(response_buf);
+}
+
+static void cmd_ping(const char* json)
+{
+    (void)json;
+    send_ok();
+}
+
+static void cmd_reboot(const char* json)
+{
+    (void)json;
+    send_ok();
+    // Defer reboot to cdc_commands_task() to avoid nested tud_task() calls
+    pending_reboot = PENDING_REBOOT;
+    pending_reboot_time = platform_time_ms();
+}
+
+#ifdef BOARD_LILYGO_TDISPLAY_S3_AMOLED
+// --- FACE.* — remote control of the AMOLED companion face (eyes_esp32.c).
+// FACE.SPEAK {"v":0-100}  speech envelope -> mouth (lip-sync)
+// FACE.STATE {"state":"idle"|"think"|"speak"}
+// FACE.EMO   {"emo":"happy"|...}
+// FACE.LOOK  {"x":-100..100,"y":-100..100}
+extern void face_remote_speak(int level);
+extern void face_remote_state(const char* state);
+extern bool face_remote_emotion(const char* name);
+extern void face_remote_look(int x_pct, int y_pct);
+
+static void cmd_face_speak(const char* json)
+{
+    int v = 0;
+    json_get_int(json, "v", &v);
+    face_remote_speak(v);
+    send_ok();
+}
+
+static void cmd_face_state(const char* json)
+{
+    int len = 0;
+    const char* st = json_get_string(json, "state", &len);
+    char buf[16] = {0};
+    if (st && len > 0 && len < (int)sizeof(buf)) memcpy(buf, st, (size_t)len);
+    face_remote_state(buf);
+    send_ok();
+}
+
+static void cmd_face_emo(const char* json)
+{
+    int len = 0;
+    const char* e = json_get_string(json, "emo", &len);
+    char buf[16] = {0};
+    if (e && len > 0 && len < (int)sizeof(buf)) memcpy(buf, e, (size_t)len);
+    if (face_remote_emotion(buf)) send_ok();
+    else send_error("unknown emotion");
+}
+
+extern bool face_remote_style(const char* name);
+
+static void cmd_face_style(const char* json)
+{
+    int len = 0;
+    const char* st = json_get_string(json, "style", &len);
+    char buf[16] = {0};
+    if (st && len > 0 && len < (int)sizeof(buf)) memcpy(buf, st, (size_t)len);
+    if (face_remote_style(buf)) send_ok();
+    else send_error("unknown style");
+}
+
+static void cmd_face_look(const char* json)
+{
+    int x = 0, y = 0;
+    json_get_int(json, "x", &x);
+    json_get_int(json, "y", &y);
+    face_remote_look(x, y);
+    send_ok();
+}
+extern bool pmu_init(void);
+extern int pmu_batt_mv(void);
+extern int pmu_vbus_mv(void);
+extern int pmu_charge_state(void);
+extern int pmu_charge_ma(void);
+extern void amoled_brightness(uint8_t level);
+
+// Two different batteries, and only one of them is usually interesting.
+//
+// pct/mv describe the BOARD's own rail through the PMU. On a Pico taking all
+// its power from USB there is no cell to measure, so that reading means
+// nothing and is reported as-is rather than dressed up.
+//
+// pad_pct is the controller's charge, which is the one a person wants. The
+// DualSense sends it in byte 52 of its input report and ds5_bt.c already
+// decodes it; this only forwards what the driver has. pad_present is false
+// when no controller is bonded, so a caller can tell "empty" from "unknown".
+static void cmd_batt_get(const char* json)
+{
+    (void)json;
+    int mv = pmu_batt_mv();
+    int pct = (mv - 3300) * 100 / (4200 - 3300);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    static const char* st[] = {"none", "pre", "charging", "done"};
+
+    extern bool ds5_companion_get_ctx(uint8_t*, bool*, uint32_t*,
+                                      uint8_t*, uint8_t*, uint8_t*);
+    uint8_t pad_pct = 0, drops = 0, catches = 0, shakes = 0;
+    bool pad_chg = false;
+    uint32_t held = 0;
+    bool pad_present = ds5_companion_get_ctx(&pad_pct, &pad_chg, &held,
+                                             &drops, &catches, &shakes);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"mv\":%d,\"pct\":%d,\"vbus_mv\":%d,"
+             "\"charge\":\"%s\",\"charge_ma\":%d,"
+             "\"pad_present\":%s,\"pad_pct\":%d,\"pad_charging\":%s}",
+             mv, pct, pmu_vbus_mv(), st[pmu_charge_state() & 3], pmu_charge_ma(),
+             pad_present ? "true" : "false", pad_present ? pad_pct : 0,
+             pad_chg ? "true" : "false");
+    cdc_protocol_send_response(active_ctx, response_buf);
+}
+
+extern void amoled_set_shift(int panel_px);
+
+static void cmd_face_offset(const char* json)
+{
+    int x = 0;
+    json_get_int(json, "x", &x);
+    if (x < -100) x = -100;
+    if (x > 100) x = 100;
+    amoled_set_shift(x);
+    send_ok();
+}
+
+static void cmd_face_bright(const char* json)
+{
+    int v = 208;
+    json_get_int(json, "v", &v);
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    amoled_brightness((uint8_t)v);
+    send_ok();
+}
+
+// FACE.TRACK: pre-shipped lip-sync envelope, played on the face's own clock
+// (zero radio traffic during speech). Chunked to fit the NUS relay:
+//   {"cmd":"FACE.TRACK","seq":0,"d":"<b64 bytes>"}   seq 0 resets the buffer
+//   {"cmd":"FACE.TRACK.GO","step":64,"delay":580}    starts playback
+extern void face_track_reset(void);
+extern bool face_track_append(const uint8_t* d, int n);
+extern void face_track_go(int step_ms, int delay_ms);
+
+static int face_b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static void cmd_face_track(const char* json)
+{
+    int seq = 0;
+    json_get_int(json, "seq", &seq);
+    if (seq == 0) face_track_reset();
+    int dlen = 0;
+    const char* d = json_get_string(json, "d", &dlen);
+    if (!d || dlen <= 0) {
+        send_error("missing d");
+        return;
+    }
+    uint8_t out[144];
+    int o = 0, acc = 0, bits = 0;
+    for (int i = 0; i < dlen && o < (int)sizeof(out); i++) {
+        int v = face_b64_val(d[i]);
+        if (v < 0) continue;                    // skip '=' / whitespace
+        acc = (acc << 6) | v; bits += 6;
+        if (bits >= 8) { bits -= 8; out[o++] = (uint8_t)(acc >> bits); }
+    }
+    if (!face_track_append(out, o)) {
+        send_error("track overflow");
+        return;
+    }
+    send_ok();
+}
+
+static void cmd_face_track_go(const char* json)
+{
+    int step = 64, delay = 0;
+    json_get_int(json, "step", &step);
+    json_get_int(json, "delay", &delay);
+    face_track_go(step, delay);
+    send_ok();
+}
+
+// FACE.COLOR {"r","g","b"} tints the current style's palette (accent derived);
+// {"reset":1} returns to the style's stock colors.
+extern void eyes_set_color(uint8_t r, uint8_t g, uint8_t b);
+extern void eyes_reset_color(void);
+static void cmd_face_color(const char* json)
+{
+    int reset = 0;
+    json_get_int(json, "reset", &reset);
+    if (reset) {
+        eyes_reset_color();
+        send_ok();
+        return;
+    }
+    int r = 0, g = 0, b = 0;
+    bool any = json_get_int(json, "r", &r);
+    any |= json_get_int(json, "g", &g);
+    any |= json_get_int(json, "b", &b);
+    if (!any) {
+        send_error("missing r/g/b");
+        return;
+    }
+    eyes_set_color((uint8_t)(r & 255), (uint8_t)(g & 255), (uint8_t)(b & 255));
+    send_ok();
+}
+#elif defined(ENABLE_BTSTACK)
+// --- FACE.* on a dongle build: relay to an untethered JoypadOS face.
+// No local display here — a paired JoypadOS BLE controller (e.g. the AMOLED
+// eyes board) carries the face, and its NUS RX feeds the same framed CDC
+// parser as USB. So forwarding = re-frame the command JSON verbatim and write
+// it to the peer's NUS. The host (e.g. Dusty's bridge) talks to one CDC port
+// and the face follows, wired or wireless.
+static void cmd_face_forward(const char* json)
+{
+    static uint8_t fwd_seq;
+    uint16_t len = (uint16_t)strlen(json);
+    uint8_t pkt[5 + 200 + 2];
+    if (len > 200) {
+        send_error("face cmd too long");
+        return;
+    }
+    pkt[0] = CDC_SYNC_BYTE;
+    pkt[1] = len & 0xFF;
+    pkt[2] = (len >> 8) & 0xFF;
+    pkt[3] = CDC_MSG_CMD;
+    pkt[4] = fwd_seq;
+    memcpy(&pkt[5], json, len);
+    uint16_t crc = cdc_crc16(&pkt[3], 2 + len);   // type + seq + payload
+    pkt[5 + len] = crc & 0xFF;
+    pkt[6 + len] = (crc >> 8) & 0xFF;
+    fwd_seq++;
+    if (btstack_host_nus_send(pkt, (uint16_t)(5 + len + 2))) send_ok();
+    else send_error("no face connected");
+}
+
+// NUS.* — forward non-FACE commands to the paired face board. The face's NUS
+// feeds the same framed command parser, so the dongle can reboot it, drop it
+// into the ROM bootloader for a reflash, or change its USB mode even when the
+// face has no usable USB of its own (e.g. a broken CDC descriptor — the exact
+// situation these were added to dig out of).
+static void cmd_nus_reboot(const char* json)
+{
+    (void)json;
+    cmd_face_forward("{\"cmd\":\"REBOOT\"}");
+}
+
+static void cmd_nus_bootsel(const char* json)
+{
+    (void)json;
+    cmd_face_forward("{\"cmd\":\"BOOTSEL\"}");
+}
+
+static void cmd_nus_mode(const char* json)
+{
+    int mode;
+    if (!json_get_int(json, "mode", &mode)) {
+        send_error("missing mode");
+        return;
+    }
+    char inner[48];
+    snprintf(inner, sizeof(inner), "{\"cmd\":\"MODE.SET\",\"mode\":%d}", mode);
+    cmd_face_forward(inner);
+}
+#endif // BOARD_LILYGO_TDISPLAY_S3_AMOLED
+
+#ifdef PLATFORM_ESP32
+// COREDUMP.SUM — panic PC + backtrace from the flash coredump (esp-idf).
+// addr2line the addresses against the matching .elf on the host.
+#include "esp_core_dump.h"
+static void cmd_coredump_sum(const char* json)
+{
+    (void)json;
+    esp_core_dump_summary_t sum;
+    if (esp_core_dump_get_summary(&sum) != ESP_OK) {
+        send_error("no coredump");
+        return;
+    }
+    int pos = snprintf(response_buf, sizeof(response_buf),
+                       "{\"task\":\"%s\",\"pc\":\"0x%08lx\",\"bt\":[",
+                       sum.exc_task, (unsigned long)sum.exc_pc);
+    for (uint32_t i = 0; i < sum.exc_bt_info.depth && i < 16; i++) {
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "%s\"0x%08lx\"", i ? "," : "",
+                        (unsigned long)sum.exc_bt_info.bt[i]);
+    }
+    snprintf(response_buf + pos, sizeof(response_buf) - pos,
+             "],\"corrupt\":%s}", sum.exc_bt_info.corrupted ? "true" : "false");
+    send_json(response_buf);
+}
+#endif
+
+static void cmd_bootsel(const char* json)
+{
+    (void)json;
+    send_ok();
+    // Defer reboot to cdc_commands_task() to avoid nested tud_task() calls
+    pending_reboot = PENDING_BOOTSEL;
+    pending_reboot_time = platform_time_ms();
+}
+
+// OTA — reboot into over-the-air (BLE) DFU. Works over the BLE NUS too (the NUS
+// tunnels this command protocol), so a USB-less nRF52 board can be updated
+// wirelessly: send OTA, then push the DFU .zip with nRF Connect.
+static void cmd_ota(const char* json)
+{
+    (void)json;
+    send_ok();
+    pending_reboot = PENDING_OTA;
+    pending_reboot_time = platform_time_ms();
+}
+
+// IMU.MAP — get/set the onboard-IMU axis remap (mounting orientation).
+// Optional x/y/z, each a signed source axis: ±1=X ±2=Y ±3=Z (negative inverts).
+// Omitted axes keep their current value. Always replies with the resulting map,
+// e.g. {"cmd":"IMU.MAP","x":-1,"y":-2,"z":3} → {"x":-1,"y":-2,"z":3}.
+static void cmd_imu_map(const char* json)
+{
+    int gx = 0, gy = 0, gz = 0;
+    bool hx = json_get_int(json, "x", &gx);
+    bool hy = json_get_int(json, "y", &gy);
+    bool hz = json_get_int(json, "z", &gz);
+    if (hx || hy || hz) {
+        router_set_motion_remap(hx ? gx : 0, hy ? gy : 0, hz ? gz : 0);
+    }
+    int m[3];
+    router_get_motion_remap(m);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"x\":%d,\"y\":%d,\"z\":%d}", m[0], m[1], m[2]);
+    send_json(response_buf);
+}
+
+// Tilt steering: roll the controller → right stick X (while D-pad is in LEFT-
+// stick mode). Tune live over CDC/NUS — no reflash.
+// {"cmd":"TILT.STEER","on":1,"range":45,"dead":3,"sign":-1} — all fields optional.
+// Weak no-op so apps that don't compile pad/pad_input.c (e.g. bt2usb) still
+// link; the real implementation overrides it wherever pad_input.c is built.
+__attribute__((weak)) void pad_set_tilt_steer(int on, int range_deg,
+                                              int dead_deg, int sign)
+{
+    (void)on; (void)range_deg; (void)dead_deg; (void)sign;
+}
+static void cmd_tilt_steer(const char* json)
+{
+    int on = -1, range = -1, dead = -1, sign = 0;
+    json_get_int(json, "on", &on);
+    json_get_int(json, "range", &range);
+    json_get_int(json, "dead", &dead);
+    json_get_int(json, "sign", &sign);
+    pad_set_tilt_steer(on, range, dead, sign);
+    send_ok();
+}
+
+static void cmd_mode_get(const char* json)
+{
+    (void)json;
+    usb_output_mode_t mode = usbd_get_mode();
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"mode\":%d,\"name\":\"%s\"}",
+             (int)mode, usbd_get_mode_name(mode));
+    send_json(response_buf);
+}
+
+static void cmd_mode_set(const char* json)
+{
+    int mode;
+    if (!json_get_int(json, "mode", &mode)) {
+        send_error("missing mode");
+        return;
+    }
+
+    if (mode < 0 || mode >= USB_OUTPUT_MODE_COUNT) {
+        send_error("invalid mode");
+        return;
+    }
+
+    usb_output_mode_t current = usbd_get_mode();
+    if ((usb_output_mode_t)mode == current) {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"mode\":%d,\"name\":\"%s\",\"reboot\":false}",
+                 mode, usbd_get_mode_name((usb_output_mode_t)mode));
+        send_json(response_buf);
+        return;
+    }
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"mode\":%d,\"name\":\"%s\",\"reboot\":true}",
+             mode, usbd_get_mode_name((usb_output_mode_t)mode));
+    send_json(response_buf);
+
+    // Flush then switch mode (triggers reboot)
+#ifdef PLATFORM_ESP32
+    tud_task_ext(1, false);
+    platform_sleep_ms(50);
+    tud_task_ext(1, false);
+#else
+    tud_task();
+    platform_sleep_ms(50);
+    tud_task();
+#endif
+    if (!usbd_set_mode((usb_output_mode_t)mode)) {
+        send_error("mode switch rejected");
+    }
+}
+
+// ============================================================================
+// MOUSE TUNING
+// ============================================================================
+// Live tuning for KB/Mouse mode. Changes apply on the next report - there is
+// no reboot and no reflash - so the pointer can be dialled in while using it.
+// MOUSE.SAVE persists to flash so the settings travel with the dongle to any
+// host, which is the whole point of doing this in firmware.
+//
+// {"cmd":"MOUSE.SET","speed":1800,"scroll_v":14,"scroll_h":10,"curve":40,
+//  "scroll_curve":75,"precision":30,"turbo":250,"noise":0,
+//  "invert_v":0,"invert_h":0,"swap":0,"no_hscroll":0}
+// Every field is optional; omitted fields keep their current value.
+
+static void cmd_mouse_report(void)
+{
+    const kbmouse_analog_config_t* c = kbmouse_get_config();
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"speed\":%u,\"scroll_v\":%u,\"scroll_h\":%u,\"curve\":%u,"
+             "\"scroll_curve\":%u,\"precision\":%u,\"turbo\":%u,\"noise\":%u,"
+             "\"invert_v\":%u,\"invert_h\":%u,\"swap\":%u,\"no_hscroll\":%u,"
+             "\"stick_mode\":%u,\"fine\":%u,\"touch_mode\":%u,\"touch_speed\":%u,"
+             "\"dial_source\":%u,\"dial_pct\":%u,"
+             "\"gyro_mode\":%u,\"gyro_orient\":%u,\"gyro_gate\":%u,"
+             "\"gyro_sens\":%u,\"gyro_invert_x\":%u,\"gyro_invert_y\":%u}",
+             (unsigned)c->pointer_speed, (unsigned)c->scroll_v,
+             (unsigned)c->scroll_h, (unsigned)c->curve,
+             (unsigned)c->scroll_curve, (unsigned)c->precision_pct,
+             (unsigned)c->turbo_pct, (unsigned)c->noise_floor,
+             (c->flags & KBMOUSE_FLAG_INVERT_V) ? 1u : 0u,
+             (c->flags & KBMOUSE_FLAG_INVERT_H) ? 1u : 0u,
+             (c->flags & KBMOUSE_FLAG_SWAP_STICKS) ? 1u : 0u,
+             (c->flags & KBMOUSE_FLAG_NO_HSCROLL) ? 1u : 0u,
+             (unsigned)c->stick_mode, (unsigned)c->fine_pct,
+             (unsigned)c->touch_mode, (unsigned)c->touch_speed,
+             (unsigned)c->dial_source, (unsigned)c->dial_pct,
+             (unsigned)c->gyro_mode, (unsigned)c->gyro_orient,
+             (unsigned)c->gyro_gate, (unsigned)c->gyro_sens,
+             (c->gyro_flags & KBMOUSE_GYRO_INVERT_X) ? 1u : 0u,
+             (c->gyro_flags & KBMOUSE_GYRO_INVERT_Y) ? 1u : 0u);
+    send_json(response_buf);
+}
+
+static void cmd_mouse_get(const char* json)
+{
+    (void)json;
+    cmd_mouse_report();
+}
+
+// Apply an integer field if present, clamped to a sane range.
+static void mouse_apply_u8(const char* json, const char* key,
+                           uint8_t* dest, int lo, int hi)
+{
+    int v;
+    if (!json_get_int(json, key, &v)) return;
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    *dest = (uint8_t)v;
+}
+
+static void mouse_apply_flag(const char* json, const char* key,
+                             uint8_t* flags, uint8_t bit)
+{
+    int v;
+    if (!json_get_int(json, key, &v)) return;
+    if (v) *flags |= bit;
+    else   *flags &= (uint8_t)~bit;
+}
+
+static void cmd_mouse_set(const char* json)
+{
+    kbmouse_analog_config_t c = *kbmouse_get_config();
+
+    int speed;
+    if (json_get_int(json, "speed", &speed)) {
+        if (speed < KBMOUSE_SPEED_MIN) speed = KBMOUSE_SPEED_MIN;
+        if (speed > KBMOUSE_SPEED_MAX) speed = KBMOUSE_SPEED_MAX;
+        c.pointer_speed = (uint16_t)speed;
+    }
+
+    mouse_apply_u8(json, "scroll_v",     &c.scroll_v,      0, 120);
+    mouse_apply_u8(json, "scroll_h",     &c.scroll_h,      0, 120);
+    mouse_apply_u8(json, "curve",        &c.curve,         0, 100);
+    mouse_apply_u8(json, "scroll_curve", &c.scroll_curve,  0, 100);
+    mouse_apply_u8(json, "precision",    &c.precision_pct, 5, 200);
+    mouse_apply_u8(json, "turbo",        &c.turbo_pct,    50, 255);
+    mouse_apply_u8(json, "noise",        &c.noise_floor,   0, 7);
+    mouse_apply_u8(json, "stick_mode",   &c.stick_mode,    0, KBM_STICK_MODE_COUNT - 1);
+    mouse_apply_u8(json, "fine",         &c.fine_pct,      1, 100);
+    mouse_apply_u8(json, "touch_mode",   &c.touch_mode,    0, KBM_TOUCH_MODE_COUNT - 1);
+    mouse_apply_u8(json, "touch_speed",  &c.touch_speed,   5, 255);
+    mouse_apply_u8(json, "dial_source",  &c.dial_source,   0, KBM_DIAL_COUNT - 1);
+    mouse_apply_u8(json, "gyro_mode",    &c.gyro_mode,     0, KBM_GYRO_MODE_COUNT - 1);
+    mouse_apply_u8(json, "gyro_orient",  &c.gyro_orient,   0, KBM_ORIENT_COUNT - 1);
+    mouse_apply_u8(json, "gyro_gate",    &c.gyro_gate,     0, KBM_GATE_COUNT - 1);
+    mouse_apply_u8(json, "gyro_sens",    &c.gyro_sens,     1, 200);
+    mouse_apply_flag(json, "gyro_invert_x", &c.gyro_flags, KBMOUSE_GYRO_INVERT_X);
+    mouse_apply_flag(json, "gyro_invert_y", &c.gyro_flags, KBMOUSE_GYRO_INVERT_Y);
+
+    int dp;
+    if (json_get_int(json, "dial_pct", &dp)) {
+        if (dp < 5)   dp = 5;
+        if (dp > 400) dp = 400;
+        c.dial_pct = (uint16_t)dp;
+    }
+
+    mouse_apply_flag(json, "invert_v",   &c.flags, KBMOUSE_FLAG_INVERT_V);
+    mouse_apply_flag(json, "invert_h",   &c.flags, KBMOUSE_FLAG_INVERT_H);
+    mouse_apply_flag(json, "swap",       &c.flags, KBMOUSE_FLAG_SWAP_STICKS);
+    mouse_apply_flag(json, "no_hscroll", &c.flags, KBMOUSE_FLAG_NO_HSCROLL);
+
+    // Turning a trigger into the speed dial costs whatever click it carried,
+    // so hand that click to the bumper above it. Written into the assignment
+    // map rather than special-cased at runtime, so it shows on the diagram and
+    // can be changed back like any other binding. Only fills a slot that is
+    // empty or still on its default, never overwrites a deliberate choice.
+    const kbmouse_analog_config_t* was = kbmouse_get_config();
+    if (c.dial_source != KBM_DIAL_OFF && was->dial_source == KBM_DIAL_OFF) {
+        uint8_t bumper = (c.dial_source == KBM_DIAL_R2) ? 5 /*R1*/ : 4 /*L1*/;
+        uint8_t cur = kbmouse_get_action(bumper);
+        if (cur == KBM_ACT_NONE || cur == KBM_ACT_MIDDLE || cur == KBM_ACT_BACK) {
+            kbmouse_set_action(bumper, KBM_ACT_RIGHT);
+        }
+    }
+
+    kbmouse_set_config(&c);
+    cmd_mouse_report();
+}
+
+static void cmd_mouse_save(const char* json)
+{
+    (void)json;
+    if (kbmouse_save_config()) send_ok();
+    else send_error("flash unavailable");
+}
+
+static void cmd_mouse_reset(const char* json)
+{
+    (void)json;
+    kbmouse_reset_config();
+    cmd_mouse_report();
+}
+
+// Forget the learned stick centre and re-seed from the next sample. Run with
+// the sticks released if the pointer ever creeps.
+// {"cmd":"MOUSE.CAL"} relearns centre. {"cmd":"MOUSE.CAL","read":1} reports what
+// it currently believes without disturbing it, so drift can be measured rather
+// than argued about: leave the controller alone, read twice a few seconds apart,
+// and compare. A centre that is still moving is calibration settling; a centre
+// that is steady while the cursor slides is something else entirely.
+static void cmd_mouse_cal(const char* json)
+{
+    int read_only = 0;
+    json_get_int(json, "read", &read_only);
+    if (!read_only) kbmouse_recalibrate();
+
+    kbmouse_centres_t c;
+    kbmouse_get_centres(&c);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"lx\":%.2f,\"ly\":%.2f,\"rx\":%.2f,\"ry\":%.2f,"
+             "\"seeded\":%s,\"settling\":%s}",
+             (double)c.lx, (double)c.ly, (double)c.rx, (double)c.ry,
+             (c.lx_seeded && c.ly_seeded && c.rx_seeded && c.ry_seeded)
+                 ? "true" : "false",
+             c.settling ? "true" : "false");
+    send_json(response_buf);
+}
+
+// Self-test. Drives the pointer directly for a bounded window with no
+// controller attached, so the report path can be proven on any machine:
+// {"cmd":"MOUSE.TEST","vx":600,"vy":0,"wheel":0,"pan":0,"buttons":0,"ms":1000}
+static void cmd_mouse_test(const char* json)
+{
+    int vx = 0, vy = 0, wheel = 0, pan = 0, buttons = 0, ms = 1000;
+    json_get_int(json, "vx", &vx);
+    json_get_int(json, "vy", &vy);
+    json_get_int(json, "wheel", &wheel);
+    json_get_int(json, "pan", &pan);
+    json_get_int(json, "buttons", &buttons);
+    json_get_int(json, "ms", &ms);
+
+    if (ms < 0) ms = 0;
+    if (buttons < 0) buttons = 0;
+    if (buttons > 0x1F) buttons = 0x1F;
+
+    kbmouse_test_drive((float)vx, (float)vy, (float)wheel, (float)pan,
+                       (uint8_t)buttons, (uint32_t)ms);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"vx\":%d,\"vy\":%d,\"wheel\":%d,\"pan\":%d,\"ms\":%d}",
+             vx, vy, wheel, pan, ms);
+    send_json(response_buf);
+}
+
+
+// ============================================================================
+// PRESETS
+// ============================================================================
+// A preset is feel, assignments and modes together, so switching one changes
+// the whole arrangement. Slot 0 is the live configuration the dongle boots
+// into; PRESET.SAVE with no slot writes there.
+//
+// PRESET.LIST -> {"presets":[{"slot":0,"used":1,"name":"..."},...]}
+// PRESET.SAVE {"slot":2,"name":"Precision"}
+// PRESET.LOAD {"slot":2}   PRESET.DELETE {"slot":2}
+
+static void cmd_preset_list(const char* json)
+{
+    (void)json;
+    int pos = snprintf(response_buf, sizeof(response_buf), "{\"presets\":[");
+    for (uint8_t i = 0; i < KBM_PRESET_SLOTS; i++) {
+        char nm[KBM_PRESET_NAME_LEN];
+        kbmouse_preset_name(i, nm, sizeof(nm));
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "%s{\"slot\":%u,\"used\":%u,\"name\":\"%.11s\"}",
+                        i ? "," : "", (unsigned)i,
+                        kbmouse_preset_used(i) ? 1u : 0u, nm);
+    }
+    snprintf(response_buf + pos, sizeof(response_buf) - pos, "]}");
+    send_json(response_buf);
+}
+
+static void cmd_preset_save(const char* json)
+{
+    int slot = KBM_PRESET_LIVE;
+    json_get_int(json, "slot", &slot);
+    if (slot < 0 || slot >= KBM_PRESET_SLOTS) { send_error("bad slot"); return; }
+
+    char name[KBM_PRESET_NAME_LEN] = {0};
+    int nlen = 0;
+    const char* nsrc = json_get_string(json, "name", &nlen);
+    if (nsrc && nlen > 0) {
+        if (nlen > KBM_PRESET_NAME_LEN - 1) nlen = KBM_PRESET_NAME_LEN - 1;
+        memcpy(name, nsrc, (size_t)nlen);
+        name[nlen] = '\0';
+    } else {
+        snprintf(name, sizeof(name),
+                 (slot == KBM_PRESET_LIVE) ? "live" : "preset %d", slot);
+    }
+    if (kbmouse_preset_save((uint8_t)slot, name)) send_ok();
+    else send_error("flash write failed");
+}
+
+static void cmd_preset_load(const char* json)
+{
+    int slot;
+    if (!json_get_int(json, "slot", &slot) || slot < 0 || slot >= KBM_PRESET_SLOTS) {
+        send_error("bad slot");
+        return;
+    }
+    if (!kbmouse_preset_load((uint8_t)slot)) { send_error("empty slot"); return; }
+    cmd_mouse_report();
+}
+
+static void cmd_preset_delete(const char* json)
+{
+    int slot;
+    if (!json_get_int(json, "slot", &slot) || slot <= 0 || slot >= KBM_PRESET_SLOTS) {
+        send_error("bad slot");
+        return;
+    }
+    if (kbmouse_preset_delete((uint8_t)slot)) send_ok();
+    else send_error("flash write failed");
+}
+
+// ============================================================================
+// CONTROL ASSIGNMENT
+// ============================================================================
+// MAP.GET  -> {"map":[a0,a1,...,a17],"names":[...]}
+// MAP.SET  {"slot":7,"action":1}
+// MAP.SAVE / MAP.RESET
+//
+// Slot index is the JP_BUTTON_* bit position, so the UI can address a control
+// by the same number it sees in the input stream.
+
+static const char* const KBM_ACTION_NAMES[] = {
+    "none", "left", "right", "middle", "back", "forward",
+    "precision", "turbo", "scroll up", "scroll down",
+    "scroll left", "scroll right", "recentre", "gyro"
+};
+
+static void cmd_map_report(void)
+{
+    int pos = snprintf(response_buf, sizeof(response_buf), "{\"map\":[");
+    for (uint8_t i = 0; i < KBMOUSE_SLOT_COUNT; i++) {
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "%s%u", i ? "," : "", (unsigned)kbmouse_get_action(i));
+    }
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "],\"names\":[");
+    for (unsigned i = 0; i < KBM_ACT_COUNT; i++) {
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "%s\"%s\"", i ? "," : "", KBM_ACTION_NAMES[i]);
+    }
+    snprintf(response_buf + pos, sizeof(response_buf) - pos, "]}");
+    send_json(response_buf);
+}
+
+static void cmd_map_get(const char* json)
+{
+    (void)json;
+    cmd_map_report();
+}
+
+static void cmd_map_set(const char* json)
+{
+    int slot, action;
+    if (!json_get_int(json, "slot", &slot) ||
+        !json_get_int(json, "action", &action)) {
+        send_error("need slot and action");
+        return;
+    }
+    if (!kbmouse_set_action((uint8_t)slot, (uint8_t)action)) {
+        send_error("slot or action out of range");
+        return;
+    }
+    cmd_map_report();
+}
+
+static void cmd_map_save(const char* json)
+{
+    (void)json;
+    if (kbmouse_save_map()) send_ok();
+    else send_error("flash unavailable");
+}
+
+static void cmd_map_reset(const char* json)
+{
+    (void)json;
+    kbmouse_reset_map();
+    cmd_map_report();
+}
+
+// {"cmd":"MOUSE.DIAG"} -> counters; {"cmd":"MOUSE.DIAG","clear":1} to zero them.
+static void cmd_mouse_diag(const char* json)
+{
+    int clear = 0;
+    json_get_int(json, "clear", &clear);
+    if (clear) {
+        kbmouse_clear_diag();
+        send_ok();
+        return;
+    }
+
+    kbmouse_diag_t d;
+    kbmouse_get_diag(&d);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"reports\":%u,\"motion\":%u,\"wheel_reports\":%u,"
+             "\"wheel_sum\":%u,\"pan_reports\":%u}",
+             (unsigned)d.reports, (unsigned)d.motion_reports,
+             (unsigned)d.wheel_reports, (unsigned)d.wheel_sum,
+             (unsigned)d.pan_reports);
+    send_json(response_buf);
+}
+
+// {"cmd":"MOUSE.PURE"} -> current identity and whether it is live yet.
+// {"cmd":"MOUSE.PURE","on":1} -> store and reboot into a mouse-only identity.
+//
+// Off, KB/Mouse shares the SInput composite: gamepad, keyboard, mouse, serial.
+// The keyboard is never written but macOS still finds an unidentified keyboard
+// and opens Keyboard Setup Assistant, which asks for a key press this device
+// cannot produce. On, the host is told about one HID interface - a mouse - plus
+// the serial port this command arrives on.
+//
+// Identity is declared at enumeration, so a change needs a reboot. "active"
+// reports what the host was actually told at the last enumeration; "stored" is
+// what the next boot will use. They differ exactly between setting this and
+// rebooting.
+static void cmd_mouse_pure(const char* json)
+{
+    int on;
+    if (!json_get_int(json, "on", &on)) {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"stored\":%d,\"active\":%d,\"reboot\":false}",
+                 kbmouse_pure_mouse() ? 1 : 0,
+                 usbd_pure_mouse_active() ? 1 : 0);
+        send_json(response_buf);
+        return;
+    }
+
+    bool want = (on != 0);
+    if (want == kbmouse_pure_mouse() && want == usbd_pure_mouse_active()) {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"stored\":%d,\"active\":%d,\"reboot\":false}",
+                 want ? 1 : 0, want ? 1 : 0);
+        send_json(response_buf);
+        return;
+    }
+
+    if (!kbmouse_set_pure_mouse(want)) {
+        send_error("flash write failed");
+        return;
+    }
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"stored\":%d,\"active\":%d,\"reboot\":true}",
+             want ? 1 : 0, usbd_pure_mouse_active() ? 1 : 0);
+    send_json(response_buf);
+
+    // Flush the reply before the port disappears underneath it.
+#ifdef PLATFORM_ESP32
+    tud_task_ext(1, false);
+    platform_sleep_ms(50);
+    tud_task_ext(1, false);
+#else
+    tud_task();
+    platform_sleep_ms(50);
+    tud_task();
+#endif
+    platform_reboot();
+}
+
+static void cmd_mode_list(const char* json)
+{
+    (void)json;
+    usb_output_mode_t current = usbd_get_mode();
+
+    int pos = snprintf(response_buf, sizeof(response_buf),
+                       "{\"current\":%d,\"modes\":[", (int)current);
+
+    bool first = true;
+    for (int i = 0; i < USB_OUTPUT_MODE_COUNT && pos < (int)sizeof(response_buf) - 50; i++) {
+        // Skip DInput (HID) mode - replaced by SInput
+        if (i == USB_OUTPUT_MODE_HID) continue;
+
+#ifndef CONFIG_JOYBUS_BRIDGE
+        // GBA Link Cable (USB vendor bridge to a forked Dolphin) is an
+        // experimental build-time opt-in — hide from the mode list on
+        // default builds so users don't pick a mode that has no working
+        // host on their machine. See docs/GBA_LINK_CABLE.md.
+        if (i == USB_OUTPUT_MODE_GBA_LINK) continue;
+#endif
+
+#ifdef CONFIG_NGC
+        // GameCube config mode: only expose CDC mode
+        if (i != USB_OUTPUT_MODE_CDC) continue;
+#endif
+
+        if (!first) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
+        first = false;
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "{\"id\":%d,\"name\":\"%s\"}", i, usbd_get_mode_name(i));
+    }
+    snprintf(response_buf + pos, sizeof(response_buf) - pos, "]}");
+    send_json(response_buf);
+}
+
+// ============================================================================
+// BLE OUTPUT MODE COMMANDS
+// ============================================================================
+
+#if REQUIRE_BLE_OUTPUT
+
+static void cmd_ble_mode_get(const char* json)
+{
+    (void)json;
+    ble_output_mode_t mode = ble_output_get_mode();
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"mode\":%d,\"name\":\"%s\"}",
+             (int)mode, ble_output_get_mode_name(mode));
+    send_json(response_buf);
+}
+
+static void cmd_ble_mode_set(const char* json)
+{
+    int mode;
+    if (!json_get_int(json, "mode", &mode)) {
+        send_error("missing mode");
+        return;
+    }
+
+    if (mode < 0 || mode >= BLE_MODE_COUNT) {
+        send_error("invalid mode");
+        return;
+    }
+
+    ble_output_mode_t current = ble_output_get_mode();
+    if ((ble_output_mode_t)mode == current) {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"mode\":%d,\"name\":\"%s\",\"reboot\":false}",
+                 mode, ble_output_get_mode_name((ble_output_mode_t)mode));
+        send_json(response_buf);
+        return;
+    }
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"mode\":%d,\"name\":\"%s\",\"reboot\":true}",
+             mode, ble_output_get_mode_name((ble_output_mode_t)mode));
+    send_json(response_buf);
+
+    // Flush then switch mode (saves to flash and reboots)
+    tud_task();
+    platform_sleep_ms(50);
+    tud_task();
+    ble_output_set_mode((ble_output_mode_t)mode);
+}
+
+static void cmd_ble_mode_list(const char* json)
+{
+    (void)json;
+    ble_output_mode_t current = ble_output_get_mode();
+
+    int pos = snprintf(response_buf, sizeof(response_buf),
+                       "{\"current\":%d,\"modes\":[", (int)current);
+
+    bool first = true;
+    for (int i = 0; i < BLE_MODE_COUNT && pos < (int)sizeof(response_buf) - 50; i++) {
+        if (!first) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
+        first = false;
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "{\"id\":%d,\"name\":\"%s\"}", i, ble_output_get_mode_name(i));
+    }
+    snprintf(response_buf + pos, sizeof(response_buf) - pos, "]}");
+    send_json(response_buf);
+}
+
+#endif // REQUIRE_BLE_OUTPUT
+
+// ============================================================================
+// UNIFIED PROFILE COMMANDS
+// ============================================================================
+//
+// Unified indexing:
+// - If app has built-in profiles (builtin_count > 0):
+//   Index 0 to builtin_count-1: Built-in profiles (builtin=true, editable=false)
+//   Index builtin_count to builtin_count+custom_count-1: Custom profiles (editable=true)
+//
+// - If app has no built-in profiles (builtin_count == 0):
+//   Index 0: Virtual "Default" passthrough (builtin=true, editable=false)
+//   Index 1 to custom_count: Custom profiles (editable=true)
+
+// Get the output target for profile queries
+// Most apps use OUTPUT_TARGET_USB_DEVICE, but console output apps
+// (e.g., usb2gc) register profiles under their native output target
+static output_target_t get_profile_target(void)
+{
+#ifdef CONFIG_NGC
+    return OUTPUT_TARGET_GAMECUBE;
+#else
+    return OUTPUT_TARGET_USB_DEVICE;
+#endif
+}
+
+static uint8_t get_builtin_count(void)
+{
+    return profile_get_count(get_profile_target());
+}
+
+static uint8_t get_custom_count(void)
+{
+    flash_t* settings = flash_get_settings();
+    return settings ? settings->custom_profile_count : 0;
+}
+
+// Get total profile count (for unified indexing)
+static uint8_t get_total_count(void)
+{
+    uint8_t builtin = get_builtin_count();
+    uint8_t custom = get_custom_count();
+    // If no built-in profiles, we show a virtual "Default" at index 0
+    return (builtin > 0 ? builtin : 1) + custom;
+}
+
+// Convert unified index to custom profile index, returns -1 if not a custom profile
+static int unified_to_custom_index(int unified_idx)
+{
+    uint8_t builtin = get_builtin_count();
+    int custom_start = (builtin > 0) ? builtin : 1;
+    if (unified_idx >= custom_start) {
+        return unified_idx - custom_start;
+    }
+    return -1;  // Not a custom profile
+}
+
+// Convert custom profile index to unified index
+static int custom_to_unified_index(int custom_idx)
+{
+    uint8_t builtin = get_builtin_count();
+    int custom_start = (builtin > 0) ? builtin : 1;
+    return custom_start + custom_idx;
+}
+
+// Check if unified index is a built-in profile
+static bool is_builtin_profile(int unified_idx)
+{
+    uint8_t builtin = get_builtin_count();
+    if (builtin > 0) {
+        return unified_idx < builtin;
+    }
+    return unified_idx == 0;  // Virtual default
+}
+
+// PROFILE.LIST - Unified list of all profiles
+static void cmd_profile_list(const char* json)
+{
+    (void)json;
+    uint8_t builtin_count = get_builtin_count();
+    flash_t* settings = flash_get_settings();
+    uint8_t custom_count = settings ? settings->custom_profile_count : 0;
+
+    // Determine active profile in unified indexing. Use the public getters so
+    // an active PROFILE.SELECT ephemeral override is visible in PROFILE.LIST
+    // (matches the runtime's view of "what's actually in effect right now").
+    //
+    // Apps with built-in profiles (e.g. usb2gc) have two independent active
+    // states: profile_get_active_index(target) for built-ins and
+    // flash_get_active_profile_index() for customs. The router/output path
+    // gives custom profiles precedence over built-ins (see
+    // flash_get_active_custom_profile() — non-NULL whenever a custom is
+    // selected). PROFILE.LIST must reflect that same precedence or the
+    // web config shows the wrong "active" after refreshing a custom-profile
+    // selection.
+    int active;
+    if (builtin_count > 0) {
+        uint8_t flash_active = flash_get_active_profile_index();
+        if (flash_active > 0) {
+            // Custom profile selected — it takes runtime precedence.
+            active = custom_to_unified_index((int)(flash_active - 1));
+        } else {
+            active = profile_get_active_index(get_profile_target());
+        }
+    } else {
+        // No built-in profiles — flash_get_active_profile_index() returns the
+        // PROFILE.SELECT sidecar if set, else the persisted value.
+        active = flash_get_active_profile_index();
+    }
+
+    int pos = snprintf(response_buf, sizeof(response_buf),
+                       "{\"ok\":true,\"active\":%d,\"profiles\":[", active);
+
+    int idx = 0;
+
+    // Add built-in profiles (or virtual Default)
+    if (builtin_count > 0) {
+        for (int i = 0; i < builtin_count && pos < (int)sizeof(response_buf) - 80; i++) {
+            const char* name = profile_get_name(get_profile_target(), i);
+            if (idx > 0) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
+            pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                            "{\"index\":%d,\"name\":\"%s\",\"builtin\":true,\"editable\":false}",
+                            idx, name ? name : "Default");
+            idx++;
+        }
+    } else {
+        // Virtual Default for apps without built-in profiles
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "{\"index\":0,\"name\":\"Default\",\"builtin\":true,\"editable\":false}");
+        idx = 1;
+    }
+
+    // Add custom profiles
+    for (int i = 0; i < custom_count && i < CUSTOM_PROFILE_MAX_COUNT && pos < (int)sizeof(response_buf) - 80; i++) {
+        const custom_profile_t* p = &settings->profiles[i];
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        ",{\"index\":%d,\"name\":\"%.11s\",\"builtin\":false,\"editable\":true}",
+                        idx, p->name);
+        idx++;
+    }
+
+    snprintf(response_buf + pos, sizeof(response_buf) - pos, "]}");
+    send_json(response_buf);
+}
+
+// PROFILE.GET - Get profile details
+static void cmd_profile_get(const char* json)
+{
+    int index;
+    if (!json_get_int(json, "index", &index)) {
+        // No index - return active profile info. Same precedence rule as
+        // PROFILE.LIST: custom-selected (flash_active > 0) wins over the
+        // app's built-in active.
+        uint8_t builtin_count = get_builtin_count();
+        int active;
+        if (builtin_count > 0) {
+            uint8_t flash_active = flash_get_active_profile_index();
+            if (flash_active > 0) {
+                active = custom_to_unified_index((int)(flash_active - 1));
+            } else {
+                active = profile_get_active_index(get_profile_target());
+            }
+        } else {
+            active = flash_get_active_profile_index();
+        }
+        index = active;
+    }
+
+    uint8_t builtin_count = get_builtin_count();
+    flash_t* settings = flash_get_settings();
+    uint8_t custom_count = settings ? settings->custom_profile_count : 0;
+    uint8_t total = get_total_count();
+
+    if (index < 0 || index >= total) {
+        send_error("invalid index");
+        return;
+    }
+
+    bool builtin = is_builtin_profile(index);
+    int custom_idx = unified_to_custom_index(index);
+
+    if (builtin) {
+        // Built-in profile (or virtual Default)
+        const char* name;
+        if (builtin_count > 0) {
+            name = profile_get_name(get_profile_target(), index);
+        } else {
+            name = "Default";
+        }
+        // Built-in profiles don't expose button_map (it's compiled in)
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"ok\":true,\"index\":%d,\"name\":\"%s\",\"builtin\":true,\"editable\":false}",
+                 index, name ? name : "Default");
+    } else {
+        // Custom profile
+        if (custom_idx < 0 || custom_idx >= custom_count) {
+            send_error("invalid index");
+            return;
+        }
+        const custom_profile_t* p = &settings->profiles[custom_idx];
+
+        // Build button map array string
+        char map_str[100];
+        int mpos = 0;
+        for (int i = 0; i < CUSTOM_PROFILE_BUTTON_COUNT; i++) {
+            if (i > 0) mpos += snprintf(map_str + mpos, sizeof(map_str) - mpos, ",");
+            mpos += snprintf(map_str + mpos, sizeof(map_str) - mpos, "%d", p->button_map[i]);
+        }
+
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"ok\":true,\"index\":%d,\"name\":\"%.11s\",\"builtin\":false,\"editable\":true,"
+                 "\"button_map\":[%s],"
+                 "\"left_stick_sens\":%d,\"right_stick_sens\":%d,\"flags\":%d,\"socd_mode\":%d}",
+                 index, p->name, map_str,
+                 p->left_stick_sens, p->right_stick_sens, p->flags, p->socd_mode);
+    }
+    send_json(response_buf);
+}
+
+// PROFILE.SELECT - Select active profile (unified index)
+static void cmd_profile_set(const char* json)
+{
+    int index;
+    if (!json_get_int(json, "index", &index)) {
+        send_error("missing index");
+        return;
+    }
+
+    uint8_t total = get_total_count();
+    if (index < 0 || index >= total) {
+        send_error("invalid index");
+        return;
+    }
+
+    uint8_t builtin_count = get_builtin_count();
+
+    if (builtin_count > 0 && index < builtin_count) {
+        // Select built-in profile. ALSO clear any persisted custom selection
+        // — flash_get_active_custom_profile() takes runtime precedence over
+        // the built-in active, so a stale flash_active > 0 would keep
+        // applying the previously-selected custom even though the UI now
+        // says built-in is active. flash_set_active_profile_index(0) =
+        // "no custom selected", which lets the built-in take effect.
+        flash_set_active_profile_index(0);
+        profile_set_active(get_profile_target(), index);
+        const char* name = profile_get_name(get_profile_target(), index);
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"ok\":true,\"index\":%d,\"name\":\"%s\"}",
+                 index, name ? name : "Default");
+    } else {
+        // Select custom profile (or default for apps without built-in)
+        int custom_idx = unified_to_custom_index(index);
+        // For flash, index 0 = default, 1+ = custom profiles
+        int flash_idx = (custom_idx < 0) ? 0 : custom_idx + 1;
+        flash_set_active_profile_index((uint8_t)flash_idx);
+
+        flash_t* settings = flash_get_settings();
+        const char* name = "Default";
+        if (custom_idx >= 0 && settings && custom_idx < settings->custom_profile_count) {
+            name = settings->profiles[custom_idx].name;
+        }
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"ok\":true,\"index\":%d,\"name\":\"%.11s\"}",
+                 index, name);
+    }
+    send_json(response_buf);
+}
+
+static void stream_throttle_reset(void);  // forward decl
+
+static void cmd_input_stream(const char* json)
+{
+    bool enable;
+    if (!json_get_bool(json, "enable", &enable)) {
+        send_error("missing enable");
+        return;
+    }
+
+    active_ctx->input_streaming = enable;
+    if (enable) {
+        stream_ctx = active_ctx;
+        // Reset throttle so the first event per device re-sends the name
+        stream_throttle_reset();
+    } else if (stream_ctx == active_ctx) {
+        stream_ctx = NULL;
+    }
+    send_ok();
+}
+
+// Parse JSON array of integers: [1,2,3,...]
+// Returns number of values parsed
+static int json_get_int_array(const char* json, const char* key,
+                               uint8_t* out, int max_count)
+{
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":[", key);
+
+    const char* start = strstr(json, search);
+    if (!start) return 0;
+
+    start += strlen(search);
+    int count = 0;
+
+    while (*start && count < max_count) {
+        // Skip whitespace
+        while (*start == ' ' || *start == '\t') start++;
+
+        if (*start == ']') break;
+
+        // Parse number
+        if (*start == '-' || (*start >= '0' && *start <= '9')) {
+            out[count++] = (uint8_t)atoi(start);
+            // Skip past number
+            while (*start == '-' || (*start >= '0' && *start <= '9')) start++;
+        }
+
+        // Skip comma
+        while (*start == ' ' || *start == '\t') start++;
+        if (*start == ',') start++;
+    }
+
+    return count;
+}
+
+// PROFILE.SAVE - Create or update custom profile (unified index)
+// index=255 creates a new profile
+static void cmd_profile_save(const char* json)
+{
+    int index;
+    if (!json_get_int(json, "index", &index)) {
+        send_error("missing index");
+        return;
+    }
+
+    // Can't modify built-in profiles
+    if (index != 255 && is_builtin_profile(index)) {
+        send_error("cannot modify built-in profile");
+        return;
+    }
+
+    // Use runtime settings to keep in sync with active profile
+    flash_t* settings = flash_get_settings();
+    if (!settings) {
+        send_error("flash not initialized");
+        return;
+    }
+
+    // Index 255 = create new
+    int custom_idx;
+    bool is_new = false;
+    if (index == 255) {
+        if (settings->custom_profile_count >= CUSTOM_PROFILE_MAX_COUNT) {
+            send_error("max profiles reached");
+            return;
+        }
+        custom_idx = settings->custom_profile_count;
+        settings->custom_profile_count++;
+        index = custom_to_unified_index(custom_idx);
+        is_new = true;
+    } else {
+        custom_idx = unified_to_custom_index(index);
+        if (custom_idx < 0 || custom_idx >= settings->custom_profile_count) {
+            send_error("invalid index");
+            return;
+        }
+    }
+
+    custom_profile_t* p = &settings->profiles[custom_idx];
+
+    // Get name
+    int name_len;
+    const char* name = json_get_string(json, "name", &name_len);
+    if (name && name_len > 0) {
+        int copy_len = name_len < CUSTOM_PROFILE_NAME_LEN - 1 ? name_len : CUSTOM_PROFILE_NAME_LEN - 1;
+        memcpy(p->name, name, copy_len);
+        p->name[copy_len] = '\0';
+    } else if (is_new) {
+        // New profile without name
+        snprintf(p->name, CUSTOM_PROFILE_NAME_LEN, "Custom %d", custom_idx + 1);
+    }
+
+    // Get button map
+    uint8_t button_map[CUSTOM_PROFILE_BUTTON_COUNT];
+    int map_count = json_get_int_array(json, "button_map", button_map, CUSTOM_PROFILE_BUTTON_COUNT);
+    if (map_count == CUSTOM_PROFILE_BUTTON_COUNT) {
+        memcpy(p->button_map, button_map, CUSTOM_PROFILE_BUTTON_COUNT);
+    } else if (map_count == 0 && is_new) {
+        // New profile - initialize to passthrough
+        memset(p->button_map, BUTTON_MAP_PASSTHROUGH, CUSTOM_PROFILE_BUTTON_COUNT);
+    }
+
+    // Get stick sensitivities
+    int sens;
+    if (json_get_int(json, "left_stick_sens", &sens)) {
+        p->left_stick_sens = (uint8_t)(sens > 200 ? 200 : (sens < 0 ? 0 : sens));
+    } else if (is_new) {
+        p->left_stick_sens = 100;
+    }
+
+    if (json_get_int(json, "right_stick_sens", &sens)) {
+        p->right_stick_sens = (uint8_t)(sens > 200 ? 200 : (sens < 0 ? 0 : sens));
+    } else if (is_new) {
+        p->right_stick_sens = 100;
+    }
+
+    // Get flags
+    int flags;
+    if (json_get_int(json, "flags", &flags)) {
+        p->flags = (uint8_t)flags;
+    }
+
+    // Get SOCD mode
+    int socd;
+    if (json_get_int(json, "socd_mode", &socd)) {
+        p->socd_mode = (uint8_t)(socd > 3 ? 0 : (socd < 0 ? 0 : socd));
+    } else if (is_new) {
+        p->socd_mode = 0;  // Default to passthrough
+    }
+
+    // Save to flash (runtime settings are already updated)
+    flash_save(settings);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"index\":%d,\"name\":\"%.11s\"}", index, p->name);
+    send_json(response_buf);
+}
+
+// PROFILE.DELETE - Delete custom profile (unified index)
+static void cmd_profile_delete(const char* json)
+{
+    int index;
+    if (!json_get_int(json, "index", &index)) {
+        send_error("missing index");
+        return;
+    }
+
+    // Can't delete built-in profiles
+    if (is_builtin_profile(index)) {
+        send_error("cannot delete built-in profile");
+        return;
+    }
+
+    // Use runtime settings to keep in sync
+    flash_t* settings = flash_get_settings();
+    if (!settings) {
+        send_error("flash not initialized");
+        return;
+    }
+
+    int custom_idx = unified_to_custom_index(index);
+    if (custom_idx < 0 || custom_idx >= settings->custom_profile_count) {
+        send_error("invalid index");
+        return;
+    }
+
+    // Shift remaining profiles down
+    for (int i = custom_idx; i < settings->custom_profile_count - 1; i++) {
+        memcpy(&settings->profiles[i], &settings->profiles[i + 1], sizeof(custom_profile_t));
+    }
+    settings->custom_profile_count--;
+
+    // Clear the last slot
+    memset(&settings->profiles[settings->custom_profile_count], 0, sizeof(custom_profile_t));
+
+    // Adjust active profile if needed (using flash index: 0=default, 1+=custom)
+    uint8_t flash_idx = custom_idx + 1;  // Convert custom_idx to flash index
+    if (settings->active_profile_index > flash_idx) {
+        settings->active_profile_index--;
+    } else if (settings->active_profile_index == flash_idx) {
+        settings->active_profile_index = 0;  // Switch to default
+    }
+
+    // Save to flash (runtime settings are already updated)
+    flash_save(settings);
+    send_ok();
+}
+
+// PROFILE.CLONE - Clone any profile (built-in or custom) to new custom profile
+static void cmd_profile_clone(const char* json)
+{
+    int source_index;
+    if (!json_get_int(json, "index", &source_index)) {
+        send_error("missing index");
+        return;
+    }
+
+    uint8_t total = get_total_count();
+    if (source_index < 0 || source_index >= total) {
+        send_error("invalid source index");
+        return;
+    }
+
+    flash_t* settings = flash_get_settings();
+    if (!settings) {
+        send_error("flash not initialized");
+        return;
+    }
+
+    if (settings->custom_profile_count >= CUSTOM_PROFILE_MAX_COUNT) {
+        send_error("max profiles reached");
+        return;
+    }
+
+    // Create new custom profile
+    int new_custom_idx = settings->custom_profile_count;
+    settings->custom_profile_count++;
+    custom_profile_t* new_profile = &settings->profiles[new_custom_idx];
+
+    // Generate name for the new profile
+    char new_name[CUSTOM_PROFILE_NAME_LEN];
+    int name_len;
+    const char* json_name = json_get_string(json, "name", &name_len);
+    if (json_name && name_len > 0) {
+        int copy_len = name_len < CUSTOM_PROFILE_NAME_LEN - 1 ? name_len : CUSTOM_PROFILE_NAME_LEN - 1;
+        memcpy(new_name, json_name, copy_len);
+        new_name[copy_len] = '\0';
+    } else {
+        // Generate name based on source
+        if (is_builtin_profile(source_index)) {
+            const char* src_name = (get_builtin_count() > 0) ?
+                profile_get_name(get_profile_target(), source_index) : "Default";
+            snprintf(new_name, CUSTOM_PROFILE_NAME_LEN, "%.6s Copy", src_name ? src_name : "Default");
+        } else {
+            int src_custom_idx = unified_to_custom_index(source_index);
+            if (src_custom_idx >= 0 && src_custom_idx < settings->custom_profile_count - 1) {
+                snprintf(new_name, CUSTOM_PROFILE_NAME_LEN, "%.6s Copy",
+                         settings->profiles[src_custom_idx].name);
+            } else {
+                snprintf(new_name, CUSTOM_PROFILE_NAME_LEN, "Custom %d", new_custom_idx + 1);
+            }
+        }
+    }
+
+    // Initialize the new profile with the generated name (sets passthrough defaults)
+    custom_profile_init(new_profile, new_name);
+
+    if (is_builtin_profile(source_index)) {
+        // Convert built-in profile_t (sparse button_map_entry_t list with bitmasks)
+        // → custom_profile_t (indexed button_map[18] with 1-based remap targets).
+        // Only single-input → single-output remaps fit the custom format; multi-bit
+        // outputs, analog targets, and combos are skipped.
+        const profile_t* src = profile_get_by_index(get_profile_target(), source_index);
+        if (src) {
+            for (uint8_t i = 0; i < src->button_map_count; i++) {
+                const button_map_entry_t* entry = &src->button_map[i];
+                uint32_t in  = entry->input;
+                uint32_t out = entry->output;
+
+                // Skip non-single-bit input or output (custom format is 1:1)
+                if (in == 0 || (in & (in - 1)) != 0) continue;
+                if (out == 0 || (out & (out - 1)) != 0) continue;
+                // Skip entries with analog target (custom format has no analog map)
+                if (entry->analog != ANALOG_TARGET_NONE) continue;
+
+                uint8_t in_bit  = (uint8_t)__builtin_ctz(in);
+                uint8_t out_bit = (uint8_t)__builtin_ctz(out);
+
+                // Custom map covers input slots 0..17 (B1..A2)
+                if (in_bit >= CUSTOM_PROFILE_BUTTON_COUNT) continue;
+                // Output target is 1-based; max value is BUTTON_MAP_MAX_TARGET (24)
+                if ((uint32_t)out_bit + 1u > BUTTON_MAP_MAX_TARGET) continue;
+
+                new_profile->button_map[in_bit] = (uint8_t)(out_bit + 1);
+            }
+
+            // Stick sensitivities: built-in float (1.0 = 100%) → custom int 0-200
+            int ls = (int)(src->left_stick_sensitivity  * 100.0f + 0.5f);
+            int rs = (int)(src->right_stick_sensitivity * 100.0f + 0.5f);
+            if (ls < 0) ls = 0; else if (ls > 200) ls = 200;
+            if (rs < 0) rs = 0; else if (rs > 200) rs = 200;
+            new_profile->left_stick_sens  = (uint8_t)ls;
+            new_profile->right_stick_sens = (uint8_t)rs;
+
+            // SOCD and trigger thresholds carry over directly
+            new_profile->socd_mode    = (uint8_t)src->socd_mode;
+            new_profile->l2_threshold = src->l2_threshold;
+            new_profile->r2_threshold = src->r2_threshold;
+        }
+    } else {
+        // Custom → custom: byte-for-byte copy of the supported fields
+        int src_custom_idx = unified_to_custom_index(source_index);
+        if (src_custom_idx >= 0 && src_custom_idx < settings->custom_profile_count - 1) {
+            const custom_profile_t* src = &settings->profiles[src_custom_idx];
+            memcpy(new_profile->button_map, src->button_map, CUSTOM_PROFILE_BUTTON_COUNT);
+            new_profile->left_stick_sens  = src->left_stick_sens;
+            new_profile->right_stick_sens = src->right_stick_sens;
+            new_profile->flags            = src->flags;
+            new_profile->socd_mode        = src->socd_mode;
+            new_profile->l2_threshold     = src->l2_threshold;
+            new_profile->r2_threshold     = src->r2_threshold;
+        }
+    }
+
+    // Save to flash
+    flash_save(settings);
+
+    int new_unified_idx = custom_to_unified_index(new_custom_idx);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"index\":%d,\"name\":\"%.11s\"}", new_unified_idx, new_profile->name);
+    send_json(response_buf);
+}
+
+// PROFILE.SELECT - Set active profile in RAM only (no flash write).
+// Same effect as PROFILE.SET for the current session, but the persistent boot
+// default is untouched — designed for live-control flows (joypad-live) that
+// would otherwise burn flash with thousands of profile switches per stream.
+// On reboot, whatever was last persisted via PROFILE.SET (or the web config)
+// is what comes back. Clears any PROFILE.APPLY override.
+static void cmd_profile_select(const char* json)
+{
+    int index;
+    if (!json_get_int(json, "index", &index)) {
+        send_error("missing index");
+        return;
+    }
+
+    uint8_t total = get_total_count();
+    if (index < 0 || index >= total) {
+        send_error("invalid index");
+        return;
+    }
+
+    uint8_t builtin_count = get_builtin_count();
+
+    if (builtin_count > 0 && index < builtin_count) {
+        // Ephemeral built-in selection (no flash write).
+        profile_select_active(get_profile_target(), index);
+        const char* name = profile_get_name(get_profile_target(), index);
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"ok\":true,\"index\":%d,\"name\":\"%s\",\"persisted\":false}",
+                 index, name ? name : "Default");
+    } else {
+        // Ephemeral custom (or virtual-Default) selection.
+        int custom_idx = unified_to_custom_index(index);
+        int flash_idx = (custom_idx < 0) ? 0 : custom_idx + 1;
+        flash_select_active_profile_index((uint8_t)flash_idx);
+
+        flash_t* settings = flash_get_settings();
+        const char* name = "Default";
+        if (custom_idx >= 0 && settings && custom_idx < settings->custom_profile_count) {
+            name = settings->profiles[custom_idx].name;
+        }
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"ok\":true,\"index\":%d,\"name\":\"%.11s\",\"persisted\":false}",
+                 index, name);
+    }
+    send_json(response_buf);
+}
+
+// PROFILE.APPLY - Apply an ephemeral runtime profile (RAM only, no flash write).
+// Designed for crowd-control / live-remap use cases: many unique button maps
+// over short windows, no flash wear, no 4-slot ceiling. Any explicit profile
+// selection (PROFILE.SET, on-device SELECT+D-pad cycling) drops the override.
+//
+// Body: { "button_map":[18 ints], "name":"...", optional left/right_stick_sens,
+//         flags, socd_mode, l2_threshold, r2_threshold }
+// Missing fields default to passthrough / 100% sens / no SOCD / no thresholds.
+static void cmd_profile_apply(const char* json)
+{
+    custom_profile_t cp;
+    memset(&cp, 0, sizeof(cp));
+    cp.left_stick_sens = 100;
+    cp.right_stick_sens = 100;
+    // button_map defaults to all-zero = BUTTON_MAP_PASSTHROUGH per memset above.
+
+    // Optional name (12 chars, null-terminated). Falls back to "Ephemeral".
+    int name_len;
+    const char* name = json_get_string(json, "name", &name_len);
+    if (name && name_len > 0) {
+        int copy_len = name_len < CUSTOM_PROFILE_NAME_LEN - 1
+                       ? name_len : CUSTOM_PROFILE_NAME_LEN - 1;
+        memcpy(cp.name, name, copy_len);
+        cp.name[copy_len] = '\0';
+    } else {
+        snprintf(cp.name, CUSTOM_PROFILE_NAME_LEN, "Ephemeral");
+    }
+
+    // button_map is optional — without it, this acts as a stick/SOCD-only override.
+    uint8_t button_map[CUSTOM_PROFILE_BUTTON_COUNT];
+    int map_count = json_get_int_array(json, "button_map", button_map,
+                                       CUSTOM_PROFILE_BUTTON_COUNT);
+    if (map_count == CUSTOM_PROFILE_BUTTON_COUNT) {
+        memcpy(cp.button_map, button_map, CUSTOM_PROFILE_BUTTON_COUNT);
+    }
+
+    int v;
+    if (json_get_int(json, "left_stick_sens", &v))
+        cp.left_stick_sens = (uint8_t)(v > 200 ? 200 : (v < 0 ? 0 : v));
+    if (json_get_int(json, "right_stick_sens", &v))
+        cp.right_stick_sens = (uint8_t)(v > 200 ? 200 : (v < 0 ? 0 : v));
+    if (json_get_int(json, "flags", &v))
+        cp.flags = (uint8_t)v;
+    if (json_get_int(json, "socd_mode", &v))
+        cp.socd_mode = (uint8_t)(v > 3 ? 0 : (v < 0 ? 0 : v));
+    if (json_get_int(json, "l2_threshold", &v))
+        cp.l2_threshold = (uint8_t)(v > 255 ? 255 : (v < 0 ? 0 : v));
+    if (json_get_int(json, "r2_threshold", &v))
+        cp.r2_threshold = (uint8_t)(v > 255 ? 255 : (v < 0 ? 0 : v));
+
+    flash_apply_ephemeral_profile(&cp);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"ephemeral\":true,\"name\":\"%.11s\"}", cp.name);
+    send_json(response_buf);
+}
+
+// PROFILE.CLEAR - Drop the ephemeral runtime override, resume the flash-stored
+// active profile. Idempotent (no-op if no override is set).
+static void cmd_profile_clear(const char* json)
+{
+    (void)json;
+    flash_clear_ephemeral_profile();
+    send_json("{\"ok\":true,\"ephemeral\":false}");
+}
+
+// OVERLAY.SET - Apply a RAM-only "live tweak" layer on top of whatever
+// profile is active (built-in, custom, or PROFILE.APPLY'd). Unlike
+// PROFILE.APPLY, the overlay does NOT replace the active button_map —
+// it only adds stick / SOCD / threshold transforms. Fields set to 0 are
+// skipped (strictly additive). Replaces any previously-set overlay.
+//
+// Body: { "flags":N, "left_stick_sens":N, "right_stick_sens":N,
+//         "socd_mode":N, "l2_threshold":N, "r2_threshold":N } — all optional.
+static void cmd_overlay_set(const char* json)
+{
+    runtime_overlay_t ov;
+    memset(&ov, 0, sizeof(ov));
+    int v;
+    if (json_get_int(json, "flags", &v))
+        ov.flags = (uint8_t)v;
+    if (json_get_int(json, "left_stick_sens", &v))
+        ov.left_stick_sens = (uint8_t)(v > 200 ? 200 : (v < 0 ? 0 : v));
+    if (json_get_int(json, "right_stick_sens", &v))
+        ov.right_stick_sens = (uint8_t)(v > 200 ? 200 : (v < 0 ? 0 : v));
+    if (json_get_int(json, "socd_mode", &v))
+        ov.socd_mode = (uint8_t)(v > 3 ? 0 : (v < 0 ? 0 : v));
+    if (json_get_int(json, "l2_threshold", &v))
+        ov.l2_threshold = (uint8_t)(v > 255 ? 255 : (v < 0 ? 0 : v));
+    if (json_get_int(json, "r2_threshold", &v))
+        ov.r2_threshold = (uint8_t)(v > 255 ? 255 : (v < 0 ? 0 : v));
+
+    flash_set_overlay(&ov);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"overlay\":true,\"flags\":%d,"
+             "\"left_stick_sens\":%d,\"right_stick_sens\":%d,"
+             "\"socd_mode\":%d,\"l2_threshold\":%d,\"r2_threshold\":%d}",
+             ov.flags, ov.left_stick_sens, ov.right_stick_sens,
+             ov.socd_mode, ov.l2_threshold, ov.r2_threshold);
+    send_json(response_buf);
+}
+
+// OVERLAY.CLEAR - Drop the runtime overlay. Idempotent.
+static void cmd_overlay_clear(const char* json)
+{
+    (void)json;
+    flash_clear_overlay();
+    send_json("{\"ok\":true,\"overlay\":false}");
+}
+
+// INPUT.INJECT - Submit a synthetic gamepad event into the router from the
+// host. Lets joypad-live let chat actually press buttons (not just remap
+// the streamer's input): a chat command like "!press a" → POST /press/a →
+// INPUT.INJECT { buttons: 1 }. The synthetic event arrives at the router as
+// a separate slot in the 0xD8..0xDF range, so it composes with the
+// streamer's real controller via the merge router mode rather than
+// replacing it.
+//
+// Body: {
+//   "buttons": <uint32 JP_BUTTON_* mask>,        required
+//   "slot":    0..7,                             optional, default 0
+//   "analog":  [LX,LY,RX,RY,L2,R2,RZ],           optional, defaults to neutral
+// }
+//
+// Stateful: each INPUT.INJECT call replaces the synthetic slot's full
+// state (matches how real controllers report). For a tap, the host sends
+// {buttons:N} then {buttons:0} after a few ms.
+static void cmd_input_inject(const char* json)
+{
+    int buttons_val;
+    if (!json_get_int(json, "buttons", &buttons_val)) {
+        send_error("missing buttons");
+        return;
+    }
+    int slot = 0;
+    json_get_int(json, "slot", &slot);
+    if (slot < 0 || slot > 7) slot = 0;
+
+    (void)slot;  // reserved; today we OR a single global mask into events
+
+    // Cache the synthetic button state in the router. Each real input event
+    // (PSX poll, USB poll, BT notification) gets `buttons |= s_inject_buttons`
+    // applied at the top of router_submit_input — works regardless of the
+    // app's routing mode (SIMPLE, MERGE, BROADCAST). Pass buttons=0 to release.
+    router_set_inject_buttons((uint32_t)buttons_val);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"buttons\":%u}",
+             (unsigned)buttons_val);
+    send_json(response_buf);
+}
+
+// Legacy alias for CPROFILE.SELECT (deprecated, use PROFILE.SET)
+static void cmd_cprofile_select(const char* json)
+{
+    // Redirect to unified PROFILE.SET
+    cmd_profile_set(json);
+}
+
+// Legacy alias for CPROFILE.LIST (deprecated, use PROFILE.LIST)
+static void cmd_cprofile_list(const char* json)
+{
+    // Redirect to unified PROFILE.LIST
+    cmd_profile_list(json);
+}
+
+// Legacy alias for CPROFILE.GET (deprecated, use PROFILE.GET)
+static void cmd_cprofile_get(const char* json)
+{
+    // Redirect to unified PROFILE.GET
+    cmd_profile_get(json);
+}
+
+// Legacy alias for CPROFILE.SET (deprecated, use PROFILE.SAVE)
+static void cmd_cprofile_set(const char* json)
+{
+    // Redirect to unified PROFILE.SAVE
+    cmd_profile_save(json);
+}
+
+// Legacy alias for CPROFILE.DELETE (deprecated, use PROFILE.DELETE)
+static void cmd_cprofile_delete(const char* json)
+{
+    // Redirect to unified PROFILE.DELETE
+    cmd_profile_delete(json);
+}
+
+#ifdef CONFIG_DS5_COMPANION
+// ============================================================================
+// AI COMPANION VOICE BRIDGE (DS5 mic -> host, host speech -> DS5 speaker)
+// ============================================================================
+
+// ds5_bt.c hooks
+extern bool ds5_companion_push_speak(const uint8_t* frame200);
+extern uint8_t ds5_companion_ring_free(void);
+extern void ds5_companion_set_state(uint8_t state);
+
+static const char b64_tab[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int voice_b64_encode(const uint8_t* in, int len, char* out, int out_max)
+{
+    int o = 0;
+    for (int i = 0; i < len; i += 3) {
+        if (o + 4 >= out_max) return -1;
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < len) v |= in[i + 2];
+        out[o++] = b64_tab[(v >> 18) & 63];
+        out[o++] = b64_tab[(v >> 12) & 63];
+        out[o++] = (i + 1 < len) ? b64_tab[(v >> 6) & 63] : '=';
+        out[o++] = (i + 2 < len) ? b64_tab[v & 63] : '=';
+    }
+    out[o] = 0;
+    return o;
+}
+
+static int voice_b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static int voice_b64_decode(const char* in, int in_len, uint8_t* out, int out_max)
+{
+    int o = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (int i = 0; i < in_len; i++) {
+        if (in[i] == '=') break;
+        int v = voice_b64_val(in[i]);
+        if (v < 0) return -1;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (o >= out_max) return -1;
+            out[o++] = (uint8_t)(acc >> bits);
+        }
+    }
+    return o;
+}
+
+// Called from the DS5 driver for every mic-audio input report while
+// listening — that call arrives DEEP in the BTstack packet-handler chain.
+// cdc_protocol_send() puts ~2KB of packet+CRC buffers on the stack, which
+// smashed the stack from that context at 100 reports/s and knocked the whole
+// device off USB the moment LISTEN engaged. So: enqueue-only here; the JSON
+// encode + CDC transmit happen in cdc_commands_task() (main loop, deep
+// stack, correct TinyUSB context).
+#define MIC_RING_SLOTS 16
+#define MIC_RING_MAX   96
+static uint8_t mic_ring[MIC_RING_SLOTS][MIC_RING_MAX];
+static uint8_t mic_ring_len[MIC_RING_SLOTS];
+static volatile uint8_t mic_ring_head, mic_ring_tail;
+
+void cdc_voice_mic_event(const uint8_t* data, uint16_t len)
+{
+    if (!stream_ctx) return;
+    uint8_t next = (uint8_t)((mic_ring_head + 1) % MIC_RING_SLOTS);
+    if (next == mic_ring_tail) return;  // full: drop (host PLC covers gaps)
+    if (len > MIC_RING_MAX) len = MIC_RING_MAX;
+    memcpy(mic_ring[mic_ring_head], data, len);
+    mic_ring_len[mic_ring_head] = (uint8_t)len;
+    mic_ring_head = next;
+}
+
+// Drained from cdc_commands_task() — see above.
+static void mic_ring_drain(void)
+{
+    while (mic_ring_tail != mic_ring_head) {
+        if (!stream_ctx) {  // stream detached: discard
+            mic_ring_tail = mic_ring_head;
+            return;
+        }
+        static char mic_buf[1200];
+        const uint8_t* data = mic_ring[mic_ring_tail];
+        uint16_t len = mic_ring_len[mic_ring_tail];
+        int n = snprintf(mic_buf, sizeof(mic_buf), "{\"type\":\"mic\",\"d\":\"");
+        int e = voice_b64_encode(data, len, mic_buf + n, (int)sizeof(mic_buf) - n - 3);
+        if (e >= 0) {
+            n += e;
+            mic_buf[n++] = '\"';
+            mic_buf[n++] = '}';
+            mic_buf[n] = 0;
+            if (cdc_protocol_send_event(stream_ctx, mic_buf) == 0) {
+                return;  // TX backlogged: retry this slot next task tick
+            }
+        }
+        mic_ring_tail = (uint8_t)((mic_ring_tail + 1) % MIC_RING_SLOTS);
+    }
+}
+
+// Companion state notifications (listen / mic_end / speak_end).
+// Same BT-context hazard as mic events: queue the name, emit from task.
+static const char* voice_notify_q[4];
+static volatile uint8_t voice_nq_head, voice_nq_tail;
+
+void cdc_voice_notify(const char* what)
+{
+    if (!stream_ctx) return;
+    uint8_t next = (uint8_t)((voice_nq_head + 1) % 4);
+    if (next == voice_nq_tail) return;
+    voice_notify_q[voice_nq_head] = what;  // callers pass string literals
+    voice_nq_head = next;
+}
+
+static void voice_notify_drain(void)
+{
+    while (voice_nq_tail != voice_nq_head) {
+        if (!stream_ctx) { voice_nq_tail = voice_nq_head; return; }
+        static char ev_buf[64];
+        snprintf(ev_buf, sizeof(ev_buf), "{\"type\":\"voice\",\"ev\":\"%s\"}",
+                 voice_notify_q[voice_nq_tail]);
+        if (cdc_protocol_send_event(stream_ctx, ev_buf) == 0) return;
+        voice_nq_tail = (uint8_t)((voice_nq_tail + 1) % 4);
+    }
+}
+
+// {"cmd":"VOICE.SPEAK","d":"<base64 of exactly 200 Opus bytes>"}
+static void cmd_voice_speak(const char* json)
+{
+    int dlen;
+    int end = 0;
+    json_get_int(json, "end", &end);
+    if (end) {
+        extern void ds5_companion_speak_flush(void);
+        ds5_companion_speak_flush();
+        return;
+    }
+    const char* d = json_get_string(json, "d", &dlen);
+    if (!d) {
+        send_error("missing d");
+        return;
+    }
+    // 1-3 Opus frames per command (200B each). Batching matters: during BT
+    // audio streaming the main loop slows and the host can only land a
+    // command every ~17ms — one frame per command (10.67ms budget) starves
+    // the ring and the audio chops. Three per command = 32ms budget.
+    uint8_t frames[600];
+    int n = voice_b64_decode(d, dlen, frames, (int)sizeof(frames));
+    if (n != 200 && n != 400 && n != 600) {
+        send_error("need 1-3 x 200-byte frames");
+        return;
+    }
+    // Fire-and-forget: no response. 89/197 speak sends measured over budget
+    // (worst 103ms) — per-command response building + TX was throttling the
+    // host's write acceptance during playback. Errors still respond.
+    for (int off = 0; off < n; off += 200) {
+        (void)ds5_companion_push_speak(frames + off);
+    }
+}
+
+// {"cmd":"VOICE.CTX"} -> controller context for the AI (battery, held time,
+// drop tally). The bridge injects this before each model turn.
+static void cmd_voice_ctx(const char* json)
+{
+    (void)json;
+    extern bool ds5_companion_get_ctx(uint8_t*, bool*, uint32_t*, uint8_t*, uint8_t*, uint8_t*);
+    uint8_t batt = 0, drops = 0, catches = 0, shakes = 0;
+    bool chg = false;
+    uint32_t held = 0;
+    if (!ds5_companion_get_ctx(&batt, &chg, &held, &drops, &catches, &shakes)) {
+        send_error("no controller");
+        return;
+    }
+    extern uint32_t ds5_companion_get_presses(char*, int);
+    extern bool ds5_companion_get_ctx2(uint8_t*, bool*, uint32_t*, char*, int);
+    char presses[160];
+    uint32_t press_age = ds5_companion_get_presses(presses, sizeof(presses));
+    uint8_t pets = 0;
+    bool flipped = false;
+    uint32_t idle_min = 0;
+    char top_btns[64] = "";
+    ds5_companion_get_ctx2(&pets, &flipped, &idle_min, top_btns, sizeof(top_btns));
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"batt\":%u,\"chg\":%s,\"held_s\":%lu,"
+             "\"drops\":%u,\"catches\":%u,\"shakes\":%u,\"pets\":%u,"
+             "\"flipped\":%s,\"idle_min\":%lu,\"top_btns\":\"%s\","
+             "\"btns\":\"%s\",\"btn_age_s\":%lu}",
+             batt, chg ? "true" : "false", (unsigned long)held, drops, catches,
+             shakes, pets, flipped ? "true" : "false",
+             (unsigned long)idle_min, top_btns,
+             presses, (unsigned long)press_age);
+    send_json(response_buf);
+}
+
+// {"cmd":"VOICE.FX","led":[r,g,b],"led_ms":N,"rumble":[lo,hi],"rumble_ms":N,
+//  "scream":true} — the model's body control (lightbar, rumble, scream)
+static bool fx_parse_triplet(const char* json, const char* key,
+                             int* a, int* b, int* c)
+{
+    char pat[24];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* q = strstr(json, pat);
+    if (!q) return false;
+    q = strchr(q, '[');
+    if (!q) return false;
+    int n = sscanf(q, c ? "[%d,%d,%d" : "[%d,%d", a, b, c ? c : a);
+    return c ? n == 3 : n == 2;
+}
+
+static void cmd_voice_fx(const char* json)
+{
+    extern bool ds5_companion_fx(const uint8_t*, uint32_t, uint8_t, uint8_t,
+                                 uint32_t, bool);
+    int r = 0, g = 0, b = 0, lo = 0, hi = 0;
+    int led_ms = 0, rum_ms = 0, scream = 0;
+    bool has_led = fx_parse_triplet(json, "led", &r, &g, &b);
+    bool has_rum = fx_parse_triplet(json, "rumble", &lo, &hi, NULL);
+    json_get_int(json, "led_ms", &led_ms);
+    json_get_int(json, "rumble_ms", &rum_ms);
+    json_get_int(json, "scream", &scream);
+    uint8_t led[3] = { (uint8_t)r, (uint8_t)g, (uint8_t)b };
+    bool ok = ds5_companion_fx(led,
+                               has_led ? (uint32_t)(led_ms > 0 ? led_ms : 3000) : 0,
+                               (uint8_t)lo, (uint8_t)hi,
+                               has_rum ? (uint32_t)(rum_ms > 0 ? rum_ms : 1000) : 0,
+                               scream != 0);
+    snprintf(response_buf, sizeof(response_buf), "{\"ok\":%s}",
+             ok ? "true" : "false");
+    send_json(response_buf);
+}
+
+// {"cmd":"VOICE.STATE","state":"idle"|"think"}
+static void cmd_voice_state(const char* json)
+{
+    int slen;
+    const char* st = json_get_string(json, "state", &slen);
+    if (!st) {
+        send_error("missing state");
+        return;
+    }
+    if (strncmp(st, "think", 5) == 0) {
+        ds5_companion_set_state(2);   // DS5_COMP_THINK
+    } else {
+        ds5_companion_set_state(0);   // DS5_COMP_IDLE
+    }
+    send_json("{\"ok\":true}");
+}
+#endif  // CONFIG_DS5_COMPANION
+
+// ============================================================================
+// DEBUG LOG STREAM COMMAND
+// ============================================================================
+
+static void cmd_debug_stream(const char* json)
+{
+    bool enable;
+    if (!json_get_bool(json, "enable", &enable)) {
+        send_error("missing enable");
+        return;
+    }
+
+    active_ctx->log_streaming = enable;
+    if (enable) {
+        stream_ctx = active_ctx;
+    } else if (stream_ctx == active_ctx) {
+        stream_ctx = NULL;
+    }
+
+    if (!enable) {
+        // Drain any stale data when disabling
+        log_tail = log_head;
+    } else {
+        // Flush stale data so only fresh logs are streamed
+        log_tail = log_head;
+    }
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"streaming\":%s}",
+             enable ? "true" : "false");
+    send_json(response_buf);
+
+    // Print after response so next drain picks it up
+    if (enable) {
+        printf("[LOG] Debug log streaming started\n");
+    }
+}
+
+// ============================================================================
+// LOG COMMANDS
+// ============================================================================
+
+// LOG.DUMP — snapshot ring buffer and stream it as log events, then send response
+static void cmd_log_dump(const char* json)
+{
+    (void)json;
+    // Snapshot: drain from current tail to current head
+    dump_pos    = log_tail;
+    dump_end    = log_head;
+    dump_active = true;
+    // Make sure we have a stream context to send events on
+    if (!stream_ctx) stream_ctx = active_ctx;
+    send_ok();
+}
+
+// LOG.CLEAR — discard all buffered log data
+static void cmd_log_clear(const char* json)
+{
+    (void)json;
+    dump_active = false;
+    log_tail = log_head;   // discard all pending streaming data
+    dump_pos = dump_end = log_head;
+    send_ok();
+}
+
+// ============================================================================
+// PS4 LOCAL AUTH COMMANDS
+// ============================================================================
+
+// Base64 decode table (-1 = invalid, -2 = padding '=')
+static const int8_t b64_table[256] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-2,-1,-1,
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+};
+
+// Decode base64 string (in_len chars) into out (max out_max bytes).
+// Returns number of bytes written, or -1 on error.
+static int b64_decode(const char *in, int in_len, uint8_t *out, int out_max)
+{
+    int out_len = 0;
+    uint32_t buf = 0;
+    int bits = 0;
+
+    for (int i = 0; i < in_len; i++) {
+        int8_t val = b64_table[(uint8_t)in[i]];
+        if (val == -1) continue;  // Skip whitespace and invalid chars
+        if (val == -2) break;     // Padding — end of data
+
+        buf = (buf << 6) | (uint32_t)val;
+        bits += 6;
+
+        if (bits >= 8) {
+            if (out_len >= out_max) return -1;  // Output overflow
+            bits -= 8;
+            out[out_len++] = (uint8_t)((buf >> bits) & 0xFF);
+        }
+    }
+    return out_len;
+}
+
+// PS4AUTH.SET — receives all key material and saves to flash
+// {"cmd":"PS4AUTH.SET","args":{"N":"<b64>","E":"<b64>","P":"<b64>","Q":"<b64>",
+//   "serial":"<b64>","signature":"<b64>"}}
+static void cmd_ps4auth_set(const char *json)
+{
+    static ps4_auth_data_t auth;
+    memset(&auth, 0, sizeof(auth));
+
+    const char *val;
+    int val_len;
+    int decoded_len;
+
+    // N — RSA modulus (256 bytes)
+    val = json_get_string(json, "N", &val_len);
+    if (!val) { send_error("missing N"); return; }
+    decoded_len = b64_decode(val, val_len, auth.rsa_n, sizeof(auth.rsa_n));
+    if (decoded_len != 256) { send_error("N must be 256 bytes"); return; }
+
+    // E — RSA public exponent (4 bytes)
+    val = json_get_string(json, "E", &val_len);
+    if (!val) { send_error("missing E"); return; }
+    decoded_len = b64_decode(val, val_len, auth.rsa_e, sizeof(auth.rsa_e));
+    if (decoded_len < 1 || decoded_len > 4) { send_error("E must be 1-4 bytes"); return; }
+    // Right-align E in 4-byte field if shorter than 4 bytes
+    if (decoded_len < 4) {
+        uint8_t tmp[4] = {0};
+        memcpy(tmp + (4 - decoded_len), auth.rsa_e, decoded_len);
+        memcpy(auth.rsa_e, tmp, 4);
+    }
+
+    // P — RSA prime (128 bytes)
+    val = json_get_string(json, "P", &val_len);
+    if (!val) { send_error("missing P"); return; }
+    decoded_len = b64_decode(val, val_len, auth.rsa_p, sizeof(auth.rsa_p));
+    if (decoded_len != 128) { send_error("P must be 128 bytes"); return; }
+
+    // Q — RSA prime (128 bytes)
+    val = json_get_string(json, "Q", &val_len);
+    if (!val) { send_error("missing Q"); return; }
+    decoded_len = b64_decode(val, val_len, auth.rsa_q, sizeof(auth.rsa_q));
+    if (decoded_len != 128) { send_error("Q must be 128 bytes"); return; }
+
+    // serial — 16 bytes
+    val = json_get_string(json, "serial", &val_len);
+    if (!val) { send_error("missing serial"); return; }
+    decoded_len = b64_decode(val, val_len, auth.serial, sizeof(auth.serial));
+    if (decoded_len != 16) { send_error("serial must be 16 bytes"); return; }
+
+    // signature — 256 bytes (sig.bin)
+    val = json_get_string(json, "signature", &val_len);
+    if (!val) { send_error("missing signature"); return; }
+    decoded_len = b64_decode(val, val_len, auth.sig, sizeof(auth.sig));
+    if (decoded_len != 256) { send_error("signature must be 256 bytes"); return; }
+
+    // Save to flash
+    ps4_auth_flash_save(&auth);
+
+#ifdef ENABLE_PS4_LOCAL_AUTH
+    // Reload local auth module so it takes effect immediately
+    ps4_local_auth_reload();
+    printf("[CDC] PS4AUTH.SET: saved, local auth=%s\n",
+           ps4_local_auth_is_available() ? "ready" : "failed");
+#else
+    printf("[CDC] PS4AUTH.SET: saved (RSA signing not available in this build)\n");
+#endif
+
+    send_ok();
+}
+
+// PS4AUTH.STATUS — returns whether auth data is installed
+static void cmd_ps4auth_status(const char *json)
+{
+    (void)json;
+
+    // Load once — reuse for both installed check and serial
+    ps4_auth_data_t auth;
+    bool installed = ps4_auth_flash_load(&auth);
+#ifdef ENABLE_PS4_LOCAL_AUTH
+    bool active = ps4_local_auth_is_available();
+    if (!installed) installed = active;
+#else
+    bool active = false;
+#endif
+
+    if (installed) {
+        char serial_hex[33] = {0};
+        for (int i = 0; i < 16; i++) {
+            snprintf(serial_hex + i * 2, 3, "%02X", auth.serial[i]);
+        }
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"installed\":true,\"active\":%s,\"serial\":\"%s\"}",
+                 active ? "true" : "false",
+                 serial_hex);
+    } else {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"installed\":false,\"active\":false}");
+    }
+    send_json(response_buf);
+}
+
+// PS4AUTH.CLEAR — removes auth data from flash
+static void cmd_ps4auth_clear(const char *json)
+{
+    (void)json;
+    ps4_auth_flash_erase();
+#ifdef ENABLE_PS4_LOCAL_AUTH
+    // Reinit local auth (will fail, disabling local auth)
+    ps4_local_auth_reload();
+#endif
+    printf("[CDC] PS4AUTH.CLEAR: auth data erased\n");
+    send_ok();
+}
+
+// ============================================================================
+// SETTINGS COMMANDS
+// ============================================================================
+
+static void cmd_settings_get(const char* json)
+{
+    (void)json;
+    flash_t flash_data;
+    if (flash_load(&flash_data)) {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"profile\":%d,\"mode\":%d}",
+                 flash_data.active_profile_index,
+                 flash_data.usb_output_mode);
+    } else {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"profile\":0,\"mode\":0,\"valid\":false}");
+    }
+    send_json(response_buf);
+}
+
+static void cmd_router_get(const char* json)
+{
+    (void)json;
+    // Compile-time defaults from app.h
+#ifndef ROUTING_MODE
+#define ROUTING_MODE 0
+#endif
+#ifndef MERGE_MODE
+#define MERGE_MODE 0
+#endif
+
+    flash_t flash_data;
+#if REQUIRE_BT_INPUT
+    uint8_t rm = ROUTING_MODE, mm = MERGE_MODE, dm = 0, bti = 1;
+#else
+    uint8_t rm = ROUTING_MODE, mm = MERGE_MODE, dm = 0, bti = 0;
+#endif
+    if (flash_load(&flash_data) && flash_data.router_saved) {
+        if (flash_data.routing_mode <= 2) rm = flash_data.routing_mode;
+        if (flash_data.merge_mode <= 2) mm = flash_data.merge_mode;
+        if (flash_data.dpad_mode <= 2) dm = flash_data.dpad_mode;
+        bti = flash_data.bt_input_enabled;
+    }
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"routing_mode\":%d,\"merge_mode\":%d,\"dpad_mode\":%d,"
+             "\"bt_input\":%s,"
+             "\"default_routing_mode\":%d,\"default_merge_mode\":%d}",
+             rm, mm, dm, bti ? "true" : "false",
+             (int)ROUTING_MODE, (int)MERGE_MODE);
+    send_json(response_buf);
+}
+
+static void cmd_router_dpad_set(const char* json)
+{
+    int mode;
+    if (!json_get_int(json, "mode", &mode) || mode < 0 || mode > 2) {
+        send_error("Invalid mode (0-2)");
+        return;
+    }
+    router_set_dpad_mode((uint8_t)mode);
+    flash_set_dpad_mode((uint8_t)mode);   // persist (no reboot needed)
+    send_ok();
+}
+
+// Capabilities: report the active app's input/output interfaces, current
+// routing mode, and registered routes. Read-only — used by the web config
+// to visualize what the running firmware supports.
+static void cmd_caps_get(const char* json)
+{
+    (void)json;
+
+#ifndef ROUTING_MODE
+#define ROUTING_MODE 0
+#endif
+#ifndef MERGE_MODE
+#define MERGE_MODE 0
+#endif
+
+    // Routing mode honors any persisted override (matches cmd_router_get).
+    flash_t flash_data;
+    uint8_t rm = ROUTING_MODE, mm = MERGE_MODE;
+    if (flash_load(&flash_data) && flash_data.router_saved) {
+        if (flash_data.routing_mode <= 2) rm = flash_data.routing_mode;
+        if (flash_data.merge_mode <= 2) mm = flash_data.merge_mode;
+    }
+
+    char* out = response_buf;
+    int rem = (int)sizeof(response_buf);
+    int n;
+
+    n = snprintf(out, rem,
+                 "{\"ok\":true,\"routing\":{\"mode\":%u,\"mode_name\":\"%s\","
+                 "\"merge_mode\":%u,\"merge_mode_name\":\"%s\"},\"inputs\":[",
+                 rm, app_registry_routing_mode_name(rm),
+                 mm, app_registry_merge_mode_name(mm));
+    if (n < 0 || n >= rem) goto overflow;
+    out += n; rem -= n;
+
+    // Track which input sources we've listed so we can backfill any source
+    // that routes reference but the input-interface registry doesn't expose
+    // (e.g. BLE Central on controller_btusb — it's routed as input but isn't
+    // a polled InputInterface). A CAPS payload whose routes point at a source
+    // missing from inputs[] is internally inconsistent and breaks host tools
+    // that map routes back to inputs.
+    uint32_t seen_sources = 0;
+    bool first_input = true;
+    uint8_t in_count = 0;
+    const InputInterface* const* ins = app_registry_inputs(&in_count);
+    for (uint8_t i = 0; i < in_count; i++) {
+        const InputInterface* it = ins ? ins[i] : NULL;
+        if (!it) continue;
+        const char* name = it->name ? it->name : "";
+        bool has_conn = (it->is_connected != NULL);
+        bool connected = has_conn ? it->is_connected() : false;
+        bool has_devs = (it->get_device_count != NULL);
+        uint8_t devs = has_devs ? it->get_device_count() : 0;
+        n = snprintf(out, rem,
+                     "%s{\"name\":\"%s\",\"source\":%d,\"source_name\":\"%s\""
+                     ",\"connected\":%s,\"devices\":%u}",
+                     first_input ? "" : ",",
+                     name, (int)it->source,
+                     app_registry_input_source_name(it->source),
+                     has_conn ? (connected ? "true" : "false") : "null",
+                     has_devs ? devs : 0);
+        if (n < 0 || n >= rem) goto overflow;
+        out += n; rem -= n;
+        first_input = false;
+        if ((unsigned)it->source < 32) seen_sources |= (1u << it->source);
+    }
+
+    // Backfill input sources referenced only by routes (not in the registry).
+    {
+        uint8_t rc = router_get_route_count();
+        for (uint8_t i = 0; i < rc; i++) {
+            const route_entry_t* r = router_get_route(i);
+            if (!r || !r->active) continue;
+            unsigned src = (unsigned)r->input;
+            if (src < 32 && (seen_sources & (1u << src))) continue;
+            if (src < 32) seen_sources |= (1u << src);
+            n = snprintf(out, rem,
+                         "%s{\"name\":\"%s\",\"source\":%d,\"source_name\":\"%s\""
+                         ",\"connected\":null,\"devices\":0}",
+                         first_input ? "" : ",",
+                         app_registry_input_source_name(r->input),
+                         (int)r->input,
+                         app_registry_input_source_name(r->input));
+            if (n < 0 || n >= rem) goto overflow;
+            out += n; rem -= n;
+            first_input = false;
+        }
+    }
+
+    n = snprintf(out, rem, "],\"outputs\":[");
+    if (n < 0 || n >= rem) goto overflow;
+    out += n; rem -= n;
+
+    uint8_t out_count = 0;
+    const OutputInterface* const* outs = app_registry_outputs(&out_count);
+    for (uint8_t i = 0; i < out_count; i++) {
+        const OutputInterface* ot = outs ? outs[i] : NULL;
+        if (!ot) continue;
+        const char* name = ot->name ? ot->name : "";
+        uint8_t max_players = 0;
+        if (ot->target >= 0 && ot->target < OUTPUT_TARGET_COUNT) {
+            max_players = router_get_max_players(ot->target);
+        }
+        n = snprintf(out, rem,
+                     "%s{\"name\":\"%s\",\"target\":%d,\"target_name\":\"%s\""
+                     ",\"max_players\":%u}",
+                     i == 0 ? "" : ",",
+                     name, (int)ot->target,
+                     app_registry_output_target_name(ot->target),
+                     max_players);
+        if (n < 0 || n >= rem) goto overflow;
+        out += n; rem -= n;
+    }
+
+    n = snprintf(out, rem, "],\"routes\":[");
+    if (n < 0 || n >= rem) goto overflow;
+    out += n; rem -= n;
+
+    uint8_t route_count = router_get_route_count();
+    bool first_route = true;
+    for (uint8_t i = 0; i < route_count; i++) {
+        const route_entry_t* r = router_get_route(i);
+        if (!r || !r->active) continue;
+        n = snprintf(out, rem,
+                     "%s{\"input\":%d,\"input_name\":\"%s\""
+                     ",\"output\":%d,\"output_name\":\"%s\""
+                     ",\"priority\":%u}",
+                     first_route ? "" : ",",
+                     (int)r->input,
+                     app_registry_input_source_name(r->input),
+                     (int)r->output,
+                     app_registry_output_target_name(r->output),
+                     r->priority);
+        if (n < 0 || n >= rem) goto overflow;
+        out += n; rem -= n;
+        first_route = false;
+    }
+
+    n = snprintf(out, rem, "]}");
+    if (n < 0 || n >= rem) goto overflow;
+    send_json(response_buf);
+    return;
+
+overflow:
+    send_error("response too large");
+}
+
+static void cmd_router_set(const char* json)
+{
+    flash_t flash_data;
+    if (!flash_load(&flash_data)) {
+        memset(&flash_data, 0, sizeof(flash_data));
+    }
+
+    int ival;
+    if (json_get_int(json, "routing_mode", &ival)) flash_data.routing_mode = (uint8_t)ival;
+    if (json_get_int(json, "merge_mode", &ival)) flash_data.merge_mode = (uint8_t)ival;
+    if (json_get_int(json, "dpad_mode", &ival)) flash_data.dpad_mode = (uint8_t)ival;
+    bool bval;
+    if (json_get_bool(json, "bt_input", &bval)) flash_data.bt_input_enabled = bval ? 1 : 0;
+    flash_data.router_saved = 1;
+
+    flash_save_force(&flash_data);
+
+    snprintf(response_buf, sizeof(response_buf), "{\"ok\":true,\"reboot\":true}");
+    send_json(response_buf);
+
+    pending_reboot = PENDING_REBOOT;
+    pending_reboot_time = platform_time_ms();
+}
+
+// ----------------------------------------------------------------------------
+// OUTPUT.NATIVE.GET / SET — generic native-output config dispatcher
+//
+// Each OutputInterface (gamecube, pcengine, maple, ...) implements its own
+// get/set_native_config callbacks that fill in the type/modes/pins schema.
+// The schema is opaque to this dispatcher — the web config renders it
+// generically. Adds a new console-output app means adding callbacks to that
+// app's OutputInterface, not editing this file.
+// ----------------------------------------------------------------------------
+
+// Find the OutputInterface that owns the native console config for this app.
+// Prefer native_output (exposed by apps even when their console output isn't
+// the active one — e.g. usb2gc in CDC config mode) and fall back to active_output.
+static const OutputInterface* find_native_output(void)
+{
+    extern const OutputInterface* native_output;
+    extern const OutputInterface* active_output;
+    if (native_output && (native_output->get_native_config || native_output->set_native_config)) {
+        return native_output;
+    }
+    if (active_output && (active_output->get_native_config || active_output->set_native_config)) {
+        return active_output;
+    }
+    return NULL;
+}
+
+static void cmd_output_native_get(const char* json)
+{
+    (void)json;
+    const OutputInterface* out = find_native_output();
+    if (!out || !out->get_native_config) {
+        snprintf(response_buf, sizeof(response_buf), "{\"ok\":true,\"available\":false}");
+        send_json(response_buf);
+        return;
+    }
+    char body[512];
+    uint16_t len = out->get_native_config(body, sizeof(body));
+    if (len == 0) {
+        snprintf(response_buf, sizeof(response_buf), "{\"ok\":true,\"available\":false}");
+        send_json(response_buf);
+        return;
+    }
+    snprintf(response_buf, sizeof(response_buf), "{\"ok\":true,\"available\":true,%.*s}", (int)len, body);
+    send_json(response_buf);
+}
+
+static void cmd_output_native_set(const char* json)
+{
+    const OutputInterface* out = find_native_output();
+    if (!out || !out->set_native_config) {
+        send_error("not available");
+        return;
+    }
+    char resp[256] = {0};
+    bool ok = out->set_native_config(json, resp, sizeof(resp));
+    if (resp[0]) {
+        send_json(resp);
+    } else {
+        if (ok) send_ok(); else send_error("set failed");
+    }
+}
+
+static void cmd_settings_reset(const char* json)
+{
+    (void)json;
+
+    // Factory reset — erase all stored data
+    flash_factory_reset();
+
+#ifdef CONFIG_PAD_INPUT
+    pad_config_reset();
+#endif
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"reboot\":true}");
+    send_json(response_buf);
+
+    // Defer reboot to cdc_commands_task()
+    pending_reboot = PENDING_REBOOT;
+    pending_reboot_time = platform_time_ms();
+}
+
+#ifdef ENABLE_BTSTACK
+// BLE.DROP {"ms":60000} — drop all BLE links, hold reconnection off for the
+// window. Bench tool for radio-contention A/B tests (e.g. DS5 audio with and
+// without the face link) without unpairing anything.
+static void cmd_ble_drop(const char* json)
+{
+    int ms = 60000;
+    json_get_int(json, "ms", &ms);
+    if (ms < 1000) ms = 1000;
+    btstack_host_ble_drop_all((uint32_t)ms);
+    send_ok();
+}
+
+static void cmd_bt_status(const char* json)
+{
+    (void)json;
+#ifdef ENABLE_BTSTACK
+    extern int btstack_host_nus_debug(int*);
+    int gattfree = -2;
+    int nus_state = btstack_host_nus_debug(&gattfree);
+#else
+    int gattfree = -2, nus_state = -1;
+#endif
+    // Determine transport at compile time
+#if defined(BTSTACK_USE_CYW43)
+    const char* transport = "Onboard (CYW43, Classic + BLE)";
+#elif defined(BTSTACK_USE_NRF)
+    const char* transport = "Onboard (nRF, BLE only)";
+#elif defined(BTSTACK_USE_ESP32)
+    const char* transport = "Onboard (ESP32, BLE only)";
+#elif defined(ENABLE_BTSTACK)
+    const char* transport = "USB Dongle (Classic + BLE)";
+#else
+    const char* transport = "None";
+#endif
+
+    // Uptime discriminates reboot-vs-USB-linkflap after a drop; crash_pc is
+    // the hard-fault black box breadcrumb (0 = no fault since power-on).
+    uint32_t crash_pc = 0, crash_lr = 0;
+#ifdef CONFIG_DS5_DROP_SCREAM
+    extern void btstack_host_get_crash_info(uint32_t* pc, uint32_t* lr);
+    btstack_host_get_crash_info(&crash_pc, &crash_lr);
+#endif
+    int pos = snprintf(response_buf, sizeof(response_buf),
+             "{\"enabled\":%s,\"scanning\":%s,\"connections\":%d,\"nus\":%d,\"gattfree\":%d,\"transport\":\"%s\","
+             "\"up_s\":%lu,\"crash_pc\":\"%08lx\",\"crash_lr\":\"%08lx\",\"devices\":[",
+             btstack_host_is_initialized() ? "true" : "false",
+             btstack_host_is_scanning() ? "true" : "false",
+             btstack_classic_get_connection_count(),
+             nus_state, gattfree, transport,
+             (unsigned long)(platform_time_ms() / 1000),
+             (unsigned long)crash_pc, (unsigned long)crash_lr);
+
+    // Track which bonded addresses are currently connected
+    uint8_t connected_addrs[8][6];
+    int connected_count = 0;
+
+    // Active connections first.
+    //
+    // Battery rides along here rather than in BATT.GET, which is compiled only
+    // for BOARD_LILYGO_TDISPLAY_S3_AMOLED and does not exist on this board — and
+    // which reads the board's own rail anyway, not the controller's. Every
+    // driver's driver_data begins with an input_event_t (bthid_set_battery_level
+    // relies on the same thing), so batt/charging work for any pad that reports
+    // them, Joy-Con as well as DualSense. 0 means the pad never said.
+    btstack_classic_conn_info_t info;
+    bool first = true;
+    for (uint8_t i = 0; i < 8; i++) {
+        if (!btstack_classic_get_connection(i, &info)) continue;
+        if (!info.active) continue;
+        memcpy(connected_addrs[connected_count++], info.bd_addr, 6);
+
+        uint8_t batt = 0;
+        bool batt_chg = false;
+        {
+            extern bthid_device_t* bthid_get_device(uint8_t conn_index);
+            bthid_device_t* d = bthid_get_device(i);
+            if (d && d->driver_data) {
+                const input_event_t* ev = (const input_event_t*)d->driver_data;
+                batt = ev->battery_level;
+                batt_chg = ev->battery_charging;
+            }
+        }
+
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                "%s{\"name\":\"%.31s\",\"addr\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
+                "\"vid\":\"%04X\",\"pid\":\"%04X\",\"ble\":%s,\"connected\":true,"
+                "\"batt\":%u,\"charging\":%s}",
+                first ? "" : ",", info.name,
+                info.bd_addr[0], info.bd_addr[1], info.bd_addr[2],
+                info.bd_addr[3], info.bd_addr[4], info.bd_addr[5],
+                info.vendor_id, info.product_id,
+                info.is_ble ? "true" : "false",
+                (unsigned)batt, batt_chg ? "true" : "false");
+        first = false;
+    }
+
+    // Last-connected bonded device (if not currently connected)
+    {
+        uint8_t bond_addr[6];
+        char bond_name[48];
+        if (btstack_host_get_last_connected(bond_addr, bond_name)) {
+            bool already_shown = false;
+            for (int j = 0; j < connected_count; j++) {
+                if (memcmp(bond_addr, connected_addrs[j], 6) == 0) { already_shown = true; break; }
+            }
+            if (!already_shown) {
+                pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "%s{\"name\":\"%.31s\",\"addr\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
+                        "\"vid\":\"\",\"pid\":\"\",\"ble\":true,\"connected\":false}",
+                        first ? "" : ",", bond_name,
+                        bond_addr[0], bond_addr[1], bond_addr[2],
+                        bond_addr[3], bond_addr[4], bond_addr[5]);
+                first = false;
+            }
+        }
+    }
+
+    snprintf(response_buf + pos, sizeof(response_buf) - pos, "]}");
+    send_json(response_buf);
+}
+
+static void cmd_bt_bonds_clear(const char* json)
+{
+    (void)json;
+    btstack_host_delete_all_bonds();
+    send_ok();
+}
+
+static void cmd_bt_forget(const char* json)
+{
+    int len;
+    const char* addr_str = json_get_string(json, "addr", &len);
+    if (!addr_str || len < 17) {
+        send_error("Missing or invalid addr");
+        return;
+    }
+
+    // Parse "AA:BB:CC:DD:EE:FF" → bytes
+    uint8_t addr[6] = {0};
+    for (int i = 0; i < 6; i++) {
+        unsigned int b;
+        if (sscanf(addr_str + i * 3, "%2x", &b) != 1) {
+            send_error("Invalid addr format");
+            return;
+        }
+        addr[i] = (uint8_t)b;
+    }
+
+    btstack_host_forget_device(addr);
+    send_ok();
+}
+
+static void cmd_wiimote_orient_get(const char* json)
+{
+    (void)json;
+    uint8_t mode = wiimote_get_orient_mode();
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"mode\":%d,\"name\":\"%s\"}",
+             mode, wiimote_get_orient_mode_name(mode));
+    send_json(response_buf);
+}
+
+static void cmd_wiimote_orient_set(const char* json)
+{
+    int mode;
+    if (!json_get_int(json, "mode", &mode)) {
+        send_error("missing mode");
+        return;
+    }
+    if (mode < 0 || mode > 2) {
+        send_error("invalid mode (0=auto, 1=horizontal, 2=vertical)");
+        return;
+    }
+    wiimote_set_orient_mode((uint8_t)mode);
+
+    // Save to flash
+    flash_t flash_data;
+    if (flash_load(&flash_data)) {
+        flash_data.wiimote_orient_mode = (uint8_t)mode;
+        flash_save(&flash_data);
+    }
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"mode\":%d,\"name\":\"%s\"}",
+             mode, wiimote_get_orient_mode_name(mode));
+    send_json(response_buf);
+}
+#endif
+
+// ============================================================================
+// MAX3421E DIAGNOSTICS
+// ============================================================================
+
+#if defined(CONFIG_MAX3421) && CFG_TUH_MAX3421
+extern bool max3421_is_detected(void);
+extern uint8_t max3421_get_revision(void);
+extern void max3421_get_diag(uint8_t *out_hirq, uint8_t *out_mode,
+                             uint8_t *out_hrsl, uint8_t *out_int_pin);
+
+static void cmd_max3421_status(const char* json)
+{
+    (void)json;
+    bool detected = max3421_is_detected();
+    if (!detected) {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"detected\":false}");
+        send_json(response_buf);
+        return;
+    }
+
+    uint8_t hirq, mode, hrsl, int_pin;
+    max3421_get_diag(&hirq, &mode, &hrsl, &int_pin);
+
+    // HRSL bits 7:6 = JSTATUS:KSTATUS
+    // J=1,K=0 = full-speed device; J=0,K=1 = low-speed device; both 0 = no device
+    bool j_status = (hrsl >> 7) & 1;
+    bool k_status = (hrsl >> 6) & 1;
+    const char* conn = "none";
+    if (j_status && !k_status) conn = "full-speed";
+    else if (!j_status && k_status) conn = "low-speed";
+    else if (j_status && k_status) conn = "se0";
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"detected\":true,\"rev\":\"0x%02X\",\"hirq\":\"0x%02X\","
+             "\"mode\":\"0x%02X\",\"hrsl\":\"0x%02X\",\"int_pin\":%d,"
+             "\"connection\":\"%s\"}",
+             max3421_get_revision(), hirq, mode, hrsl, int_pin, conn);
+    send_json(response_buf);
+}
+#endif
+
+// ============================================================================
+// PLAYER MANAGEMENT
+// ============================================================================
+
+// PLAYERS.LIST - Get list of connected players/controllers
+static void cmd_players_list(const char* json)
+{
+    (void) json;
+
+    // Build JSON array of players
+    int len = snprintf(response_buf, sizeof(response_buf), "{\"count\":%d,\"players\":[", playersCount);
+
+    for (int i = 0; i < playersCount && i < MAX_PLAYERS; i++) {
+        if (players[i].dev_addr == -1) continue;  // Skip empty slots
+
+        const char* name = get_player_name(i);
+        const char* transport;
+        switch (players[i].transport) {
+            case INPUT_TRANSPORT_USB: transport = "usb"; break;
+            case INPUT_TRANSPORT_BT_CLASSIC: transport = "bt_classic"; break;
+            case INPUT_TRANSPORT_BT_BLE: transport = "bt_ble"; break;
+            case INPUT_TRANSPORT_NATIVE: transport = "native"; break;
+            default: transport = "unknown"; break;
+        }
+
+        // Most USB/BT controllers support rumble
+        bool supports_rumble = (players[i].transport == INPUT_TRANSPORT_USB ||
+                               players[i].transport == INPUT_TRANSPORT_BT_CLASSIC ||
+                               players[i].transport == INPUT_TRANSPORT_BT_BLE);
+
+        len += snprintf(response_buf + len, sizeof(response_buf) - len,
+                        "%s{\"slot\":%d,\"name\":\"%s\",\"transport\":\"%s\",\"rumble\":%s}",
+                        i > 0 ? "," : "",
+                        i,
+                        name ? name : "Unknown",
+                        transport,
+                        supports_rumble ? "true" : "false");
+    }
+
+    snprintf(response_buf + len, sizeof(response_buf) - len, "]}");
+    send_json(response_buf);
+}
+
+// ============================================================================
+// RUMBLE TEST
+// ============================================================================
+
+// State for auto-stopping rumble after duration
+static struct {
+    bool active;
+    uint32_t start_ms;
+    uint32_t duration_ms;
+    int player;  // -1 for all players
+} rumble_test_state = {0};
+
+// RUMBLE.TEST - Test rumble on a player's controller
+// {"cmd":"RUMBLE.TEST","player":0,"left":255,"right":255,"duration":500}
+// player: 0-based index, or -1 for all players
+// left/right: motor intensity 0-255
+// duration: optional, ms (default 500, max 5000)
+static void cmd_rumble_test(const char* json)
+{
+    int player = 0;
+    int left = 128;
+    int right = 128;
+    int duration = 500;
+
+    json_get_int(json, "player", &player);
+    json_get_int(json, "left", &left);
+    json_get_int(json, "right", &right);
+    json_get_int(json, "duration", &duration);
+
+    // Clamp values
+    if (left < 0) left = 0;
+    if (left > 255) left = 255;
+    if (right < 0) right = 0;
+    if (right > 255) right = 255;
+    if (duration < 0) duration = 0;
+    if (duration > 5000) duration = 5000;
+
+    printf("[CDC] RUMBLE.TEST: player=%d left=%d right=%d duration=%d\n",
+           player, left, right, duration);
+
+    // Apply rumble via feedback system
+    if (player == -1) {
+        // All players
+        for (int i = 0; i < playersCount && i < MAX_PLAYERS; i++) {
+            if (players[i].dev_addr != -1) {
+                feedback_set_rumble_internal(i, (uint8_t)left, (uint8_t)right);
+            }
+        }
+    } else if (player >= 0 && player < playersCount && players[player].dev_addr != -1) {
+        feedback_set_rumble_internal(player, (uint8_t)left, (uint8_t)right);
+    } else {
+        send_error("invalid player");
+        return;
+    }
+
+    // Store state for auto-stop
+    if (duration > 0 && (left > 0 || right > 0)) {
+        rumble_test_state.active = true;
+        rumble_test_state.start_ms = platform_time_ms();
+        rumble_test_state.duration_ms = duration;
+        rumble_test_state.player = player;
+    }
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"player\":%d,\"left\":%d,\"right\":%d,\"duration\":%d}",
+             player, left, right, duration);
+    send_json(response_buf);
+}
+
+// RUMBLE.STOP - Stop rumble on a player's controller
+static void cmd_rumble_stop(const char* json)
+{
+    int player = -1;
+    json_get_int(json, "player", &player);
+
+    if (player == -1) {
+        // All players
+        for (int i = 0; i < playersCount && i < MAX_PLAYERS; i++) {
+            if (players[i].dev_addr != -1) {
+                feedback_set_rumble_internal(i, 0, 0);
+            }
+        }
+    } else if (player >= 0 && player < playersCount) {
+        feedback_set_rumble_internal(player, 0, 0);
+    }
+
+    rumble_test_state.active = false;
+    send_ok();
+}
+
+// Call from main loop to auto-stop rumble after duration and drain log buffer
+void cdc_commands_task(void)
+{
+#ifdef CONFIG_DS5_COMPANION
+    mic_ring_drain();
+    voice_notify_drain();
+#endif
+
+    // Handle deferred reboots (runs outside tud_task/protocol handler context)
+    if (pending_reboot != PENDING_NONE) {
+        uint32_t elapsed = platform_time_ms() - pending_reboot_time;
+        if (elapsed >= 50) {
+            uint8_t type = pending_reboot;
+            pending_reboot = PENDING_NONE;
+            printf("[CDC] Executing deferred %s...\n",
+                   type == PENDING_BOOTSEL ? "bootloader" :
+                   type == PENDING_OTA ? "OTA DFU" : "reboot");
+            // Disconnect USB cleanly so host sees device removal
+            tud_disconnect();
+            platform_sleep_ms(500);
+            if (type == PENDING_BOOTSEL) {
+                platform_reboot_bootloader();
+            } else if (type == PENDING_OTA) {
+                platform_reboot_ota();
+            } else {
+                platform_reboot();
+            }
+        }
+    }
+
+    if (rumble_test_state.active) {
+        uint32_t now = platform_time_ms();
+        if (now - rumble_test_state.start_ms >= rumble_test_state.duration_ms) {
+            // Stop rumble
+            if (rumble_test_state.player == -1) {
+                for (int i = 0; i < MAX_PLAYERS; i++) {
+                    feedback_set_rumble_internal(i, 0, 0);
+                }
+            } else {
+                feedback_set_rumble_internal(rumble_test_state.player, 0, 0);
+            }
+            rumble_test_state.active = false;
+            printf("[CDC] RUMBLE.TEST: auto-stopped after %lu ms\n",
+                   (unsigned long)rumble_test_state.duration_ms);
+        }
+    }
+
+    // Drain log ring buffer and send as events
+    if (stream_ctx && stream_ctx->log_streaming && log_head != log_tail) {
+        // Collect up to 256 raw bytes from ring buffer
+        char raw[256];
+        int raw_len = 0;
+        while (log_tail != log_head && raw_len < (int)sizeof(raw)) {
+            raw[raw_len++] = log_ring[log_tail];
+            log_tail = (log_tail + 1) % LOG_BUF_SIZE;
+        }
+
+        if (raw_len > 0) {
+            // Build JSON event with escaped message
+            // Prefix: {"type":"log","msg":"  = 22 chars
+            // Suffix: "}                     = 2 chars
+            // Max overhead per char: 2 (for \n, \", \\)
+            int pos = 0;
+            pos += snprintf(log_event_buf + pos, sizeof(log_event_buf) - pos,
+                            "{\"type\":\"log\",\"msg\":\"");
+            for (int i = 0; i < raw_len && pos < (int)sizeof(log_event_buf) - 10; i++) {
+                char c = raw[i];
+                if (c == '\\') {
+                    log_event_buf[pos++] = '\\';
+                    log_event_buf[pos++] = '\\';
+                } else if (c == '"') {
+                    log_event_buf[pos++] = '\\';
+                    log_event_buf[pos++] = '"';
+                } else if (c == '\n') {
+                    log_event_buf[pos++] = '\\';
+                    log_event_buf[pos++] = 'n';
+                } else if (c == '\r') {
+                    log_event_buf[pos++] = '\\';
+                    log_event_buf[pos++] = 'r';
+                } else if (c == '\t') {
+                    log_event_buf[pos++] = '\\';
+                    log_event_buf[pos++] = 't';
+                } else if (c >= 0x20) {
+                    log_event_buf[pos++] = c;
+                }
+                // Drop other control characters
+            }
+            log_event_buf[pos++] = '"';
+            log_event_buf[pos++] = '}';
+            log_event_buf[pos] = '\0';
+
+            if (stream_ctx) {
+                cdc_protocol_send_event(stream_ctx, log_event_buf);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// PAD CONFIG COMMANDS (controller apps only)
+// ============================================================================
+
+#ifdef CONFIG_PAD_INPUT
+
+// Button field names for JSON serialization (matches PAD_BTN_* order)
+static const char* const pad_button_names[] = {
+    "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+    "b1", "b2", "b3", "b4",
+    "l1", "r1", "l2", "r2",
+    "s1", "s2", "l3", "r3",
+    "a1", "a2", "a3", "a4", "l4", "r4",
+};
+
+// Helper: extract int16_t array from JSON "key":[1,2,3,...]
+static int json_get_int16_array(const char* json, const char* key,
+                                int16_t* out, int max_count)
+{
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":[", key);
+
+    const char* start = strstr(json, search);
+    if (!start) return 0;
+
+    start += strlen(search);
+    int count = 0;
+
+    while (*start && count < max_count) {
+        while (*start == ' ' || *start == '\t') start++;
+        if (*start == ']') break;
+
+        if (*start == '-' || (*start >= '0' && *start <= '9')) {
+            out[count++] = (int16_t)atoi(start);
+            while (*start == '-' || (*start >= '0' && *start <= '9')) start++;
+        }
+
+        while (*start == ' ' || *start == '\t') start++;
+        if (*start == ',') start++;
+    }
+
+    return count;
+}
+
+static void cmd_pad_config_get(const char* json)
+{
+    (void)json;
+
+    bool has_custom = pad_config_has_custom();
+    const pad_device_config_t* config;
+    pad_config_flash_t flash_data;
+
+    if (has_custom) {
+        config = pad_config_load_runtime();
+    } else {
+        // No custom config — report compile-time default from pad_input
+        config = pad_input_get_config(0);
+    }
+
+    if (!config) {
+        // No config saved and no compile-time default — return empty defaults
+        // so the web config page still shows (user can create a config)
+        static const pad_device_config_t empty_config = PAD_CONFIG_INIT("Custom Pad");
+        config = &empty_config;
+        has_custom = false;
+    }
+
+    // Convert to flash format for consistent serialization
+    pad_config_to_flash(config, &flash_data);
+
+    // Build JSON response - split across multiple snprintf calls due to size
+    int pos = 0;
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    "{\"ok\":true,\"source\":\"%s\",\"name\":\"%s\"",
+                    has_custom ? "flash" : "default",
+                    flash_data.name);
+
+    // Flags
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"active_high\":%s",
+                    (flash_data.flags & PAD_FLAG_ACTIVE_HIGH) ? "true" : "false");
+
+    // I2C
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"i2c_sda\":%d,\"i2c_scl\":%d",
+                    flash_data.i2c_sda, flash_data.i2c_scl);
+
+    // Deadzone + d-pad mode
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"deadzone\":%d,\"dpad_mode\":%d", flash_data.deadzone, flash_data.dpad_mode);
+
+    // Buttons array
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",\"buttons\":[");
+    for (int i = 0; i < PAD_BTN_COUNT; i++) {
+        if (i > 0) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "%d", flash_data.buttons[i]);
+    }
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "]");
+
+    // D-pad toggle
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"toggles\":[[%d,%d,%d],[%d,%d,%d]]",
+                    flash_data.toggle[0].pin, flash_data.toggle[0].function, flash_data.toggle[0].flags,
+                    flash_data.toggle[1].pin, flash_data.toggle[1].function, flash_data.toggle[1].flags);
+
+    // ADC
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"adc\":[%d,%d,%d,%d,%d,%d]",
+                    flash_data.adc_channels[0], flash_data.adc_channels[1],
+                    flash_data.adc_channels[2], flash_data.adc_channels[3],
+                    flash_data.adc_channels[4], flash_data.adc_channels[5]);
+
+    // ADC invert flags
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"invert_lx\":%s,\"invert_ly\":%s,\"invert_rx\":%s,\"invert_ry\":%s"
+                    ",\"sinput_rgb\":%s",
+                    (flash_data.flags & PAD_FLAG_INVERT_LX) ? "true" : "false",
+                    (flash_data.flags & PAD_FLAG_INVERT_LY) ? "true" : "false",
+                    (flash_data.flags & PAD_FLAG_INVERT_RX) ? "true" : "false",
+                    (flash_data.flags & PAD_FLAG_INVERT_RY) ? "true" : "false",
+                    (flash_data.flags & PAD_FLAG_SINPUT_RGB) ? "true" : "false");
+
+    // LED (effective pad config + system defaults).
+    //   stored 0  → reported as sys default (what the firmware actually uses)
+    //   stored >0 → reported as override pin
+    //   stored <0 → reported as -1 (explicitly disabled by user)
+    // This way both old + new web-config JS render the right pin.
+    int report_led_pin   = (flash_data.led_pin == 0) ? WS2812_PIN : flash_data.led_pin;
+    int report_led_count = (flash_data.led_pin == 0 && flash_data.led_count == 0)
+                                ? WS2812_NUM_PIXELS : flash_data.led_count;
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"led_pin\":%d,\"led_count\":%d,\"sys_led_pin\":%d,\"sys_led_count\":%d"
+                    ",\"onboard_led\":%d",
+                    report_led_pin, report_led_count, WS2812_PIN, WS2812_NUM_PIXELS,
+                    flash_data.onboard_led);
+
+    // Speaker
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"speaker_pin\":%d,\"speaker_enable_pin\":%d",
+                    flash_data.speaker_pin, flash_data.speaker_enable_pin);
+
+    // USB host. sys_usb_host_dp must reflect the actual compile-time pin
+    // the firmware uses, not pico-pio-usb's library-internal default.
+    // We set PICO_DEFAULT_PIO_USB_DP_PIN per-target in CMakeLists.txt; if
+    // that isn't defined for this build, USB host isn't wired at all.
+#ifdef PICO_DEFAULT_PIO_USB_DP_PIN
+#define SYS_USB_HOST_DP PICO_DEFAULT_PIO_USB_DP_PIN
+#else
+#define SYS_USB_HOST_DP -1
+#endif
+    int report_usb_host_dp = (flash_data.usb_host_dp == 0) ? SYS_USB_HOST_DP : flash_data.usb_host_dp;
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"usb_host_dp\":%d,\"sys_usb_host_dp\":%d"
+                    ",\"joywing\":[[%d,%d,%d,%d],[%d,%d,%d,%d]]",
+                    report_usb_host_dp, SYS_USB_HOST_DP,
+                    flash_data.joywing[0].i2c_bus, flash_data.joywing[0].sda, flash_data.joywing[0].scl, flash_data.joywing[0].addr,
+                    flash_data.joywing[1].i2c_bus, flash_data.joywing[1].sda, flash_data.joywing[1].scl, flash_data.joywing[1].addr);
+
+    // Function key pins
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"f1_pin\":%d,\"f2_pin\":%d",
+                    flash_data.f1_pin, flash_data.f2_pin);
+
+    // Combo remaps
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"combos\":[[%lu,%lu],[%lu,%lu],[%lu,%lu],[%lu,%lu]]",
+                    (unsigned long)flash_data.combo[0].input_mask, (unsigned long)flash_data.combo[0].output_mask,
+                    (unsigned long)flash_data.combo[1].input_mask, (unsigned long)flash_data.combo[1].output_mask,
+                    (unsigned long)flash_data.combo[2].input_mask, (unsigned long)flash_data.combo[2].output_mask,
+                    (unsigned long)flash_data.combo[3].input_mask, (unsigned long)flash_data.combo[3].output_mask);
+
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "}");
+
+    send_json(response_buf);
+}
+
+static void cmd_pad_config_set(const char* json)
+{
+    pad_device_config_t config;
+    memset(&config, 0, sizeof(config));
+
+    // Name
+    int name_len;
+    const char* name = json_get_string(json, "name", &name_len);
+    static char set_name[PAD_CONFIG_NAME_LEN];
+    if (name && name_len > 0) {
+        int copy_len = name_len < (PAD_CONFIG_NAME_LEN - 1) ? name_len : (PAD_CONFIG_NAME_LEN - 1);
+        memcpy(set_name, name, copy_len);
+        set_name[copy_len] = '\0';
+        config.name = set_name;
+    } else {
+        config.name = "Custom";
+    }
+
+    // Flags
+    bool bval;
+    if (json_get_bool(json, "active_high", &bval)) config.active_high = bval;
+    if (json_get_bool(json, "invert_lx", &bval)) config.invert_lx = bval;
+    if (json_get_bool(json, "invert_ly", &bval)) config.invert_ly = bval;
+    if (json_get_bool(json, "invert_rx", &bval)) config.invert_rx = bval;
+    if (json_get_bool(json, "invert_ry", &bval)) config.invert_ry = bval;
+    if (json_get_bool(json, "sinput_rgb", &bval)) config.sinput_rgb = bval;
+
+    // I2C
+    int ival;
+    config.i2c_sda = PAD_PIN_DISABLED;
+    config.i2c_scl = PAD_PIN_DISABLED;
+    if (json_get_int(json, "i2c_sda", &ival)) config.i2c_sda = (int8_t)ival;
+    if (json_get_int(json, "i2c_scl", &ival)) config.i2c_scl = (int8_t)ival;
+
+    // Deadzone
+    config.deadzone = 10;
+    if (json_get_int(json, "deadzone", &ival)) config.deadzone = (uint8_t)ival;
+    config.dpad_mode = 0;
+    if (json_get_int(json, "dpad_mode", &ival)) config.dpad_mode = (uint8_t)ival;
+
+    // Buttons array (22 int16_t values)
+    int16_t buttons[PAD_BTN_COUNT];
+    for (int i = 0; i < PAD_BTN_COUNT; i++) buttons[i] = PAD_PIN_DISABLED;
+    int btn_count = json_get_int16_array(json, "buttons", buttons, PAD_BTN_COUNT);
+    if (btn_count > 0) {
+        config.dpad_up    = buttons[PAD_BTN_DPAD_UP];
+        config.dpad_down  = buttons[PAD_BTN_DPAD_DOWN];
+        config.dpad_left  = buttons[PAD_BTN_DPAD_LEFT];
+        config.dpad_right = buttons[PAD_BTN_DPAD_RIGHT];
+        config.b1  = buttons[PAD_BTN_B1];
+        config.b2  = buttons[PAD_BTN_B2];
+        config.b3  = buttons[PAD_BTN_B3];
+        config.b4  = buttons[PAD_BTN_B4];
+        config.l1  = buttons[PAD_BTN_L1];
+        config.r1  = buttons[PAD_BTN_R1];
+        config.l2  = buttons[PAD_BTN_L2];
+        config.r2  = buttons[PAD_BTN_R2];
+        config.s1  = buttons[PAD_BTN_S1];
+        config.s2  = buttons[PAD_BTN_S2];
+        config.l3  = buttons[PAD_BTN_L3];
+        config.r3  = buttons[PAD_BTN_R3];
+        config.a1  = buttons[PAD_BTN_A1];
+        config.a2  = buttons[PAD_BTN_A2];
+        config.a3  = buttons[PAD_BTN_A3];
+        config.a4  = buttons[PAD_BTN_A4];
+        config.l4  = buttons[PAD_BTN_L4];
+        config.r4  = buttons[PAD_BTN_R4];
+    }
+
+    // Toggle switches (array of [pin, function, flags])
+    for (int i = 0; i < 2; i++) {
+        config.toggle[i].pin = PAD_PIN_DISABLED;
+        config.toggle[i].function = 0;
+        config.toggle[i].invert = false;
+    }
+    {
+        char key[20];
+        for (int i = 0; i < 2; i++) {
+            snprintf(key, sizeof(key), "toggle%d_pin", i);
+            if (json_get_int(json, key, &ival)) config.toggle[i].pin = (int16_t)ival;
+            snprintf(key, sizeof(key), "toggle%d_func", i);
+            if (json_get_int(json, key, &ival)) config.toggle[i].function = (uint8_t)ival;
+            snprintf(key, sizeof(key), "toggle%d_inv", i);
+            if (json_get_int(json, key, &ival)) config.toggle[i].invert = ival != 0;
+        }
+    }
+
+    // ADC channels
+    int8_t adc[6] = {PAD_PIN_DISABLED, PAD_PIN_DISABLED, PAD_PIN_DISABLED, PAD_PIN_DISABLED, PAD_PIN_DISABLED, PAD_PIN_DISABLED};
+    int16_t adc_temp[6];
+    int adc_count = json_get_int16_array(json, "adc", adc_temp, 6);
+    if (adc_count > 0) {
+        for (int i = 0; i < adc_count && i < 6; i++) adc[i] = (int8_t)adc_temp[i];
+    }
+    config.adc_lx = adc[0];
+    config.adc_ly = adc[1];
+    config.adc_rx = adc[2];
+    config.adc_ry = adc[3];
+    config.adc_lt = adc[4];
+    config.adc_rt = adc[5];
+
+    // LED
+    config.led_pin = PAD_PIN_DISABLED;
+    config.led_count = 0;
+    config.onboard_led = PAD_ONBOARD_LED_DEFAULT;
+    if (json_get_int(json, "led_pin", &ival)) config.led_pin = (int8_t)ival;
+    if (json_get_int(json, "led_count", &ival)) config.led_count = (uint8_t)ival;
+    if (json_get_int(json, "onboard_led", &ival)) config.onboard_led = (uint8_t)ival;
+
+    // Speaker
+    config.speaker_pin = PAD_PIN_DISABLED;
+    config.speaker_enable_pin = PAD_PIN_DISABLED;
+    if (json_get_int(json, "speaker_pin", &ival)) config.speaker_pin = (int8_t)ival;
+    if (json_get_int(json, "speaker_enable_pin", &ival)) config.speaker_enable_pin = (int8_t)ival;
+
+    // Display (optional, default disabled)
+    config.display_spi = PAD_PIN_DISABLED;
+    config.display_sck = PAD_PIN_DISABLED;
+    config.display_mosi = PAD_PIN_DISABLED;
+    config.display_cs = PAD_PIN_DISABLED;
+    config.display_dc = PAD_PIN_DISABLED;
+    config.display_rst = PAD_PIN_DISABLED;
+
+    // QWIIC (optional, default disabled)
+    config.qwiic_tx = PAD_PIN_DISABLED;
+    config.qwiic_rx = PAD_PIN_DISABLED;
+    config.qwiic_i2c_inst = PAD_PIN_DISABLED;
+
+    // USB host
+    config.usb_host_dp = PAD_PIN_DISABLED;
+    if (json_get_int(json, "usb_host_dp", &ival)) config.usb_host_dp = (int8_t)ival;
+
+    // JoyWing (array of [bus,sda,scl,addr])
+    for (int i = 0; i < 2; i++) {
+        config.joywing[i].i2c_bus = 0;
+        config.joywing[i].sda = PAD_PIN_DISABLED;
+        config.joywing[i].scl = PAD_PIN_DISABLED;
+        config.joywing[i].addr = 0x49;
+    }
+    {
+        char key[20];
+        for (int i = 0; i < 2; i++) {
+            snprintf(key, sizeof(key), "joywing%d_bus", i);
+            if (json_get_int(json, key, &ival)) config.joywing[i].i2c_bus = (int8_t)ival;
+            snprintf(key, sizeof(key), "joywing%d_sda", i);
+            if (json_get_int(json, key, &ival)) config.joywing[i].sda = (int8_t)ival;
+            snprintf(key, sizeof(key), "joywing%d_scl", i);
+            if (json_get_int(json, key, &ival)) config.joywing[i].scl = (int8_t)ival;
+            snprintf(key, sizeof(key), "joywing%d_addr", i);
+            if (json_get_int(json, key, &ival)) config.joywing[i].addr = (uint8_t)ival;
+        }
+    }
+
+    // Function key pins
+    config.f1 = PAD_PIN_DISABLED;
+    config.f2 = PAD_PIN_DISABLED;
+    if (json_get_int(json, "f1_pin", &ival)) config.f1 = (int16_t)ival;
+    if (json_get_int(json, "f2_pin", &ival)) config.f2 = (int16_t)ival;
+
+    // Combo remaps
+    {
+        char key[20];
+        for (int i = 0; i < PAD_COMBO_MAX; i++) {
+            snprintf(key, sizeof(key), "combo%d_in", i);
+            if (json_get_int(json, key, &ival)) config.combo[i].input_mask = (uint32_t)ival;
+            snprintf(key, sizeof(key), "combo%d_out", i);
+            if (json_get_int(json, key, &ival)) config.combo[i].output_mask = (uint32_t)ival;
+        }
+    }
+
+    // Save to flash
+    pad_config_save(&config);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"reboot\":true}");
+    send_json(response_buf);
+
+    // Defer reboot so response gets sent
+    pending_reboot = PENDING_REBOOT;
+    pending_reboot_time = platform_time_ms();
+}
+
+static void cmd_pad_config_reset(const char* json)
+{
+    (void)json;
+    pad_config_reset();
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"reboot\":true}");
+    send_json(response_buf);
+
+    pending_reboot = PENDING_REBOOT;
+    pending_reboot_time = platform_time_ms();
+}
+
+static void cmd_pad_config_pins(const char* json)
+{
+    (void)json;
+
+    // Report available GPIO pins for this board
+    // RP2040 has GPIO 0-29, ADC on channels 0-3 (GPIO 26-29)
+    int pos = 0;
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    "{\"ok\":true,\"gpio\":[");
+
+    // GPIO 0-29 (all available on RP2040)
+    for (int i = 0; i <= 29; i++) {
+        if (i > 0) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "%d", i);
+    }
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "]");
+
+    // ADC channels
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"adc\":[0,1,2,3]");
+
+    // I2C expander pin ranges
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"i2c_exp_0\":[100,115],\"i2c_exp_1\":[200,215]");
+
+    // Button names for UI labels
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                    ",\"button_names\":[");
+    for (int i = 0; i < PAD_BTN_COUNT; i++) {
+        if (i > 0) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "\"%s\"", pad_button_names[i]);
+    }
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "]");
+
+    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "}");
+    send_json(response_buf);
+}
+
+#endif // CONFIG_PAD_INPUT
+
+// ============================================================================
+// JOYBUS BRIDGE COMMANDS (gc2usb only)
+// ============================================================================
+//
+// Surface joybus_bridge.c via CDC so a host-side daemon can drive raw
+// joybus traffic — currently used for GBA multiboot upload (Kawasedo
+// cipher in JS), eventually for Dolphin live link traffic and GameCube
+// controller polling. Bus-generic primitive; bridge layer doesn't know
+// or care what protocol the daemon is implementing on top.
+//
+// See .dev/docs/dolphin-gba-bridge.md for the architecture + phasing.
+
+// Gate on an explicit compile definition rather than __has_include — every
+// target gets src/ on its include path via joypad_target_common, so the
+// header is always reachable even when joybus_bridge.c isn't linked.
+#ifdef CONFIG_JOYBUS_BRIDGE
+#define HAVE_JOYBUS_BRIDGE 1
+#include "native/host/gc/joybus_bridge.h"
+#endif
+
+#ifdef HAVE_JOYBUS_BRIDGE
+
+// Tiny hex parser/emitter — no allocation, no validation overhead. The
+// daemon is trusted; if it sends bad hex we just truncate. Bytes are
+// small (joybus xfers cap at a handful of bytes typically).
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int parse_hex(const char* json, const char* key,
+                     uint8_t* out, int max_bytes)
+{
+    int len = 0;
+    const char* hex = json_get_string(json, key, &len);
+    if (!hex || len == 0 || (len & 1)) return 0;
+    int bytes = len / 2;
+    if (bytes > max_bytes) bytes = max_bytes;
+    for (int i = 0; i < bytes; i++) {
+        int hi = hex_nibble(hex[2*i]);
+        int lo = hex_nibble(hex[2*i + 1]);
+        if (hi < 0 || lo < 0) return i;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return bytes;
+}
+
+static void emit_hex(char* dst, const uint8_t* src, int n)
+{
+    static const char H[] = "0123456789abcdef";
+    for (int i = 0; i < n; i++) {
+        dst[2*i]   = H[(src[i] >> 4) & 0xF];
+        dst[2*i+1] = H[src[i] & 0xF];
+    }
+    dst[2*n] = '\0';
+}
+
+static void cmd_joybus_bridge_start(const char* json)
+{
+    (void)json;
+    if (!joybus_bridge_start()) {
+        send_error("Could not acquire joybus port (gc_host not initialized?)");
+        return;
+    }
+    send_ok();
+}
+
+static void cmd_joybus_bridge_stop(const char* json)
+{
+    (void)json;
+    joybus_bridge_stop();
+    send_ok();
+}
+
+static void cmd_joybus_bridge_status(const char* json)
+{
+    (void)json;
+    joybus_bridge_state_t s = joybus_bridge_get_state();
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"state\":\"%s\"}",
+             s == JOYBUS_BRIDGE_ACTIVE ? "ACTIVE" : "IDLE");
+    send_json(response_buf);
+}
+
+// JOYBUS.XFER — primitive joybus exchange.
+//   Request:  {"cmd":"JOYBUS.XFER","tx":"<hex>","rx_len":N,"timeout_us":M}
+//   Response: {"ok":true,"rx":"<hex>","got":N}   on success
+//             {"ok":false,"error":"...","code":-N}   on bus error
+//
+// timeout_us defaults to 1000 (1 ms) if omitted; rx_len defaults to 0.
+static void cmd_joybus_xfer(const char* json)
+{
+    uint8_t tx[32];
+    int tx_len = parse_hex(json, "tx", tx, sizeof(tx));
+
+    int rx_len = 0;
+    json_get_int(json, "rx_len", &rx_len);
+    if (rx_len < 0) rx_len = 0;
+    if (rx_len > 32) rx_len = 32;
+
+    int timeout_us = 1000;
+    json_get_int(json, "timeout_us", &timeout_us);
+    if (timeout_us < 1) timeout_us = 1;
+
+    uint8_t rx[32];
+    int got = joybus_bridge_xfer(tx, (uint16_t)tx_len,
+                                 rx, (uint16_t)rx_len,
+                                 (uint32_t)timeout_us);
+    if (got < 0) {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"ok\":false,\"error\":\"xfer failed\",\"code\":%d}", got);
+        send_json(response_buf);
+        return;
+    }
+    char hex[2 * 32 + 1];
+    emit_hex(hex, rx, got);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"rx\":\"%s\",\"got\":%d}", hex, got);
+    send_json(response_buf);
+}
+
+// JOYBUS.BATCH — execute N joybus xfers in a single CDC roundtrip.
+// Per-xfer encoding (binary, hex'd into "ops" string):
+//   tx_len(1) | tx[tx_len] | rx_len(1)
+// Per-xfer response (binary, hex'd into "out" string):
+//   err_abs(1) | got(1) | rx[got]    (err_abs=0 on success)
+//
+// Single batch-wide timeout in JSON ("timeout_us", default 5000).
+//
+// This is the throughput primitive. Single JOYBUS.XFER pays a USB FS
+// roundtrip (~2 ms) per call — devastating for the ~13.5K writes a
+// 54 KB multiboot needs (~30 s of pure USB overhead). With BATCH, a
+// daemon can pack ~70 ops per CDC frame and amortize the USB cost
+// down to well under 1 s for the same upload. Joybus bus time itself
+// is unchanged (~3.4 s for 54 KB), so total ≈ 4 s instead of 30+.
+static void cmd_joybus_batch(const char* json)
+{
+    int ops_hex_len = 0;
+    const char* ops_hex = json_get_string(json, "ops", &ops_hex_len);
+    if (!ops_hex || (ops_hex_len & 1)) { send_error("missing/odd ops"); return; }
+
+    int timeout_us = 5000;
+    json_get_int(json, "timeout_us", &timeout_us);
+    if (timeout_us < 1) timeout_us = 1;
+
+    // Walk encoded ops, execute, accumulate raw response bytes.
+    static uint8_t out_buf[480];   // ~960 hex chars; well under CDC max.
+    int out_len = 0;
+    int i = 0;
+    while (i + 2 <= ops_hex_len) {
+        int tx_len = (hex_nibble(ops_hex[i]) << 4) | hex_nibble(ops_hex[i+1]);
+        i += 2;
+        if (tx_len < 0 || tx_len > 32 || i + tx_len*2 + 2 > ops_hex_len) break;
+
+        uint8_t tx[32];
+        for (int j = 0; j < tx_len; j++) {
+            tx[j] = (hex_nibble(ops_hex[i + 2*j]) << 4) | hex_nibble(ops_hex[i + 2*j + 1]);
+        }
+        i += tx_len * 2;
+
+        int rx_len = (hex_nibble(ops_hex[i]) << 4) | hex_nibble(ops_hex[i+1]);
+        i += 2;
+        if (rx_len < 0 || rx_len > 32) break;
+        if (out_len + 2 + rx_len > (int)sizeof(out_buf)) break;  // would overflow rsp
+
+        uint8_t rx[32];
+        int got = joybus_bridge_xfer(tx, (uint16_t)tx_len, rx, (uint16_t)rx_len,
+                                     (uint32_t)timeout_us);
+        uint8_t err = (got < 0) ? (uint8_t)(-got) : 0;
+        if (got < 0) got = 0;
+        out_buf[out_len++] = err;
+        out_buf[out_len++] = (uint8_t)got;
+        memcpy(&out_buf[out_len], rx, got);
+        out_len += got;
+        // Settle between ops — matches the sleep_us(GBA_DELAY_US=70)
+        // gba_multiboot.c puts before each WRITE. The cable's level-
+        // shifter MCU and the GBA's BIOS multiboot handler both need a
+        // small gap to process the previous exchange before accepting
+        // the next; without it, batched WRITEs land but the BIOS gets
+        // confused and silently rejects the upload at CRC time.
+        sleep_us(70);
+    }
+
+    static char hex_out[2 * sizeof(out_buf) + 1];
+    emit_hex(hex_out, out_buf, out_len);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"out\":\"%s\"}", hex_out);
+    send_json(response_buf);
+}
+
+// ============================================================================
+// GBA multiboot — staged upload (firmware-native timing)
+// ============================================================================
+// JS-driven upload over JOYBUS.XFER/BATCH can't keep up with the BIOS's
+// inter-WRITE timing tolerance (CDC roundtrips between batches stall the
+// handshake long enough for BIOS to silently reject at CRC). So multiboot
+// gets a specialized path: stream the ROM in via GBA.MB.CHUNK, then fire
+// GBA.MB.UPLOAD which runs the upload natively in firmware.
+//
+// This trades flexibility (host can't tweak per-WRITE timing) for
+// reliability. JS still owns the bus via JOYBUS.BRIDGE.START — the
+// staging path piggybacks on that ownership.
+
+static void cmd_gba_mb_reset(const char* json)
+{
+    (void)json;
+    joybus_bridge_mb_reset();
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"size\":0}");
+    send_json(response_buf);
+}
+
+static void cmd_gba_mb_chunk(const char* json)
+{
+    uint8_t buf[480];   // ~960 hex chars; leaves headroom for JSON keys
+    int n = parse_hex(json, "data", buf, sizeof(buf));
+    if (n <= 0) { send_error("missing/empty data"); return; }
+    if (!joybus_bridge_mb_append(buf, n)) {
+        send_error("buffer overflow (rom > 64 KB)");
+        return;
+    }
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"size\":%lu}",
+             (unsigned long)joybus_bridge_mb_size());
+    send_json(response_buf);
+}
+
+static void cmd_gba_mb_upload(const char* json)
+{
+    int channel = 0;
+    json_get_int(json, "channel", &channel);
+    int r = joybus_bridge_mb_upload(channel);
+    if (r == 0) {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"ok\":true,\"size\":%lu}",
+                 (unsigned long)joybus_bridge_mb_size());
+    } else {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"ok\":false,\"code\":%d,\"size\":%lu}",
+                 r, (unsigned long)joybus_bridge_mb_size());
+    }
+    send_json(response_buf);
+}
+#endif  // HAVE_JOYBUS_BRIDGE
+
+// ============================================================================
+// SD CARD COMMANDS (smoke-test surface — proves FatFs + HAL work)
+// ============================================================================
+
+#ifdef CONFIG_SD
+#include "core/services/sd/sd.h"
+#include "ff.h"
+
+static void cmd_sd_info(const char* json)
+{
+    (void)json;
+    if (!sd_mounted()) {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"ok\":true,\"mounted\":false}");
+    } else {
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"ok\":true,\"mounted\":true,"
+                 "\"total_bytes\":%llu,\"free_bytes\":%llu}",
+                 (unsigned long long)sd_total_bytes(),
+                 (unsigned long long)sd_free_bytes());
+    }
+    send_json(response_buf);
+}
+
+static void cmd_sd_list(const char* json)
+{
+    const char* path = "/";
+    char path_buf[64];
+    int path_len = 0;
+    const char* path_in = json_get_string(json, "path", &path_len);
+    if (path_in && path_len > 0 && path_len < (int)sizeof(path_buf)) {
+        memcpy(path_buf, path_in, path_len);
+        path_buf[path_len] = '\0';
+        path = path_buf;
+    }
+    if (!sd_mounted()) {
+        send_error("sd not mounted");
+        return;
+    }
+    DIR dir;
+    if (f_opendir(&dir, path) != FR_OK) {
+        send_error("opendir failed");
+        return;
+    }
+    int pos = snprintf(response_buf, sizeof(response_buf),
+                       "{\"ok\":true,\"path\":\"%s\",\"entries\":[", path);
+    FILINFO info;
+    bool first = true;
+    while (f_readdir(&dir, &info) == FR_OK && info.fname[0]
+           && pos < (int)sizeof(response_buf) - 80) {
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "%s{\"name\":\"%.40s\",\"size\":%lu,\"dir\":%s}",
+                        first ? "" : ",",
+                        info.fname,
+                        (unsigned long)info.fsize,
+                        (info.fattrib & AM_DIR) ? "true" : "false");
+        first = false;
+    }
+    f_closedir(&dir);
+    snprintf(response_buf + pos, sizeof(response_buf) - pos, "]}");
+    send_json(response_buf);
+}
+#endif // CONFIG_SD
+
+// ============================================================================
+// COMMAND DISPATCH
+// ============================================================================
+
+typedef void (*cmd_handler_t)(const char* json);
+
+typedef struct {
+    const char* name;
+    cmd_handler_t handler;
+} cmd_entry_t;
+
+static const cmd_entry_t commands[] = {
+    {"INFO", cmd_info},
+    {"MP.STATS", cmd_mp_stats},
+    {"MP.MODE", cmd_mp_mode},
+    {"PING", cmd_ping},
+    {"REBOOT", cmd_reboot},
+    {"BOOTSEL", cmd_bootsel},
+#ifdef PLATFORM_ESP32
+    {"COREDUMP.SUM", cmd_coredump_sum},
+#endif
+#ifdef BOARD_LILYGO_TDISPLAY_S3_AMOLED
+    {"FACE.SPEAK", cmd_face_speak},
+    {"FACE.STATE", cmd_face_state},
+    {"FACE.EMO", cmd_face_emo},
+    {"FACE.LOOK", cmd_face_look},
+    {"FACE.BRIGHT", cmd_face_bright},
+    {"FACE.OFFSET", cmd_face_offset},
+    {"FACE.STYLE", cmd_face_style},
+    {"FACE.COLOR", cmd_face_color},
+    {"FACE.TRACK", cmd_face_track},
+    {"FACE.TRACK.GO", cmd_face_track_go},
+    {"BATT.GET", cmd_batt_get},
+#elif defined(ENABLE_BTSTACK)
+    // Relay every FACE.* command to a paired JoypadOS face over BLE NUS.
+    {"FACE.SPEAK", cmd_face_forward},
+    {"FACE.STATE", cmd_face_forward},
+    {"FACE.EMO", cmd_face_forward},
+    {"FACE.LOOK", cmd_face_forward},
+    {"FACE.BRIGHT", cmd_face_forward},
+    {"FACE.OFFSET", cmd_face_forward},
+    {"FACE.STYLE", cmd_face_forward},
+    {"FACE.COLOR", cmd_face_forward},
+    {"FACE.TRACK", cmd_face_forward},
+    {"FACE.TRACK.GO", cmd_face_forward},
+    // Remote management of the paired face over the same NUS tunnel.
+    {"NUS.REBOOT", cmd_nus_reboot},
+    {"NUS.BOOTSEL", cmd_nus_bootsel},
+    {"NUS.MODE", cmd_nus_mode},
+#endif
+    {"OTA", cmd_ota},
+    {"MODE.GET", cmd_mode_get},
+    {"MODE.SET", cmd_mode_set},
+    {"MODE.LIST", cmd_mode_list},
+    // Mouse tuning (KB/Mouse mode)
+    {"MOUSE.GET", cmd_mouse_get},
+    {"MOUSE.SET", cmd_mouse_set},
+    {"MOUSE.SAVE", cmd_mouse_save},
+    {"MOUSE.RESET", cmd_mouse_reset},
+    {"MOUSE.CAL", cmd_mouse_cal},
+    {"MOUSE.TEST", cmd_mouse_test},
+    {"MOUSE.DIAG", cmd_mouse_diag},
+    {"MOUSE.PURE", cmd_mouse_pure},
+    {"MAP.GET", cmd_map_get},
+    {"MAP.SET", cmd_map_set},
+    {"MAP.SAVE", cmd_map_save},
+    {"MAP.RESET", cmd_map_reset},
+    {"PRESET.LIST", cmd_preset_list},
+    {"PRESET.SAVE", cmd_preset_save},
+    {"PRESET.LOAD", cmd_preset_load},
+    {"PRESET.DELETE", cmd_preset_delete},
+    {"IMU.MAP", cmd_imu_map},
+    {"TILT.STEER", cmd_tilt_steer},
+    // Unified profile commands
+    {"PROFILE.LIST", cmd_profile_list},
+    {"PROFILE.GET", cmd_profile_get},
+    {"PROFILE.SET", cmd_profile_set},
+    {"PROFILE.SAVE", cmd_profile_save},
+    {"PROFILE.DELETE", cmd_profile_delete},
+    {"PROFILE.CLONE", cmd_profile_clone},
+    {"PROFILE.APPLY", cmd_profile_apply},
+    {"PROFILE.CLEAR", cmd_profile_clear},
+    {"PROFILE.SELECT", cmd_profile_select},
+    {"OVERLAY.SET", cmd_overlay_set},
+    {"OVERLAY.CLEAR", cmd_overlay_clear},
+    {"INPUT.INJECT", cmd_input_inject},
+    // Legacy CPROFILE.* aliases (deprecated - redirect to unified commands)
+    {"CPROFILE.LIST", cmd_cprofile_list},
+    {"CPROFILE.GET", cmd_cprofile_get},
+    {"CPROFILE.SET", cmd_cprofile_set},
+    {"CPROFILE.DELETE", cmd_cprofile_delete},
+    {"CPROFILE.SELECT", cmd_cprofile_select},
+    {"INPUT.STREAM", cmd_input_stream},
+    {"DEBUG.STREAM", cmd_debug_stream},
+    {"SETTINGS.GET", cmd_settings_get},
+    {"SETTINGS.RESET", cmd_settings_reset},
+    {"ROUTER.GET", cmd_router_get},
+    {"ROUTER.SET", cmd_router_set},
+    {"ROUTER.DPAD.SET", cmd_router_dpad_set},
+    {"CAPS.GET", cmd_caps_get},
+    {"OUTPUT.NATIVE.GET", cmd_output_native_get},
+    {"OUTPUT.NATIVE.SET", cmd_output_native_set},
+#ifdef HAVE_JOYBUS_BRIDGE
+    {"JOYBUS.BRIDGE.START", cmd_joybus_bridge_start},
+    {"JOYBUS.BRIDGE.STOP", cmd_joybus_bridge_stop},
+    {"JOYBUS.BRIDGE.STATUS", cmd_joybus_bridge_status},
+    {"JOYBUS.XFER", cmd_joybus_xfer},
+    {"JOYBUS.BATCH", cmd_joybus_batch},
+    {"GBA.MB.RESET", cmd_gba_mb_reset},
+    {"GBA.MB.CHUNK", cmd_gba_mb_chunk},
+    {"GBA.MB.UPLOAD", cmd_gba_mb_upload},
+#endif
+    // Player management
+    {"PLAYERS.LIST", cmd_players_list},
+    // Rumble testing
+    {"RUMBLE.TEST", cmd_rumble_test},
+    {"RUMBLE.STOP", cmd_rumble_stop},
+#if defined(CONFIG_MAX3421) && CFG_TUH_MAX3421
+    {"MAX3421.STATUS", cmd_max3421_status},
+#endif
+#ifdef ENABLE_BTSTACK
+#ifdef CONFIG_DS5_COMPANION
+    {"VOICE.SPEAK", cmd_voice_speak},
+    {"VOICE.CTX", cmd_voice_ctx},
+    {"VOICE.FX", cmd_voice_fx},
+    {"VOICE.STATE", cmd_voice_state},
+#endif
+    {"BT.STATUS", cmd_bt_status},
+    {"BLE.DROP", cmd_ble_drop},
+    {"BT.BONDS.CLEAR", cmd_bt_bonds_clear},
+    {"BT.FORGET", cmd_bt_forget},
+    {"WIIMOTE.ORIENT.GET", cmd_wiimote_orient_get},
+    {"WIIMOTE.ORIENT.SET", cmd_wiimote_orient_set},
+#endif
+#if REQUIRE_BLE_OUTPUT
+    {"BLE.MODE.GET", cmd_ble_mode_get},
+    {"BLE.MODE.SET", cmd_ble_mode_set},
+    {"BLE.MODE.LIST", cmd_ble_mode_list},
+#endif
+#ifdef CONFIG_PAD_INPUT
+    {"PAD.CONFIG.GET", cmd_pad_config_get},
+    {"PAD.CONFIG.SET", cmd_pad_config_set},
+    {"PAD.CONFIG.RESET", cmd_pad_config_reset},
+    {"PAD.CONFIG.PINS", cmd_pad_config_pins},
+#endif
+#ifdef CONFIG_SD
+    {"SD.INFO", cmd_sd_info},
+    {"SD.LIST", cmd_sd_list},
+#endif
+    {"LOG.DUMP",       cmd_log_dump},
+    {"LOG.CLEAR",      cmd_log_clear},
+    {"PS4AUTH.SET",    cmd_ps4auth_set},
+    {"PS4AUTH.STATUS", cmd_ps4auth_status},
+    {"PS4AUTH.CLEAR",  cmd_ps4auth_clear},
+    {NULL, NULL}
+};
+
+// ============================================================================
+// PACKET HANDLER
+// ============================================================================
+
+static void packet_handler(const cdc_packet_t* packet)
+{
+    if (packet->type != CDC_MSG_CMD) {
+        // Only handle CMD packets here
+        return;
+    }
+
+    // Null-terminate payload for string operations
+    static char json[CDC_MAX_PAYLOAD + 1];
+    memcpy(json, packet->payload, packet->length);
+    json[packet->length] = '\0';
+
+    // Extract command name
+    char cmd[32];
+    if (!json_get_cmd(json, cmd, sizeof(cmd))) {
+        send_error("invalid command format");
+        return;
+    }
+
+    // Find and execute handler
+    for (const cmd_entry_t* entry = commands; entry->name; entry++) {
+        if (strcmp(cmd, entry->name) == 0) {
+            entry->handler(json);
+            return;
+        }
+    }
+
+    send_error("unknown command");
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+void cdc_commands_init(void)
+{
+    cdc_protocol_init(&protocol_ctx, packet_handler);
+
+    // Register stdio hook to capture printf output into ring buffer
+#if defined(PLATFORM_ESP32) || defined(PLATFORM_NRF) || defined(PLATFORM_CH32)
+    // Replace stdout with a tee: ring buffer + original output
+    platform_orig_stdout = stdout;
+    FILE *f = funopen(NULL, NULL, platform_log_writefn, NULL, NULL);
+    if (f) {
+        setvbuf(f, NULL, _IONBF, 0);
+        stdout = f;
+    }
+#else
+    stdio_set_driver_enabled(&log_stdio_driver, true);
+#endif
+
+    // Debug: print build info at startup
+    printf("[CDC] Build Info Debug:\n");
+    printf("[CDC]   APP_NAME: %s\n", APP_NAME);
+    printf("[CDC]   JOYPAD_VERSION: %s\n", JOYPAD_VERSION);
+    printf("[CDC]   GIT_COMMIT: %s\n", GIT_COMMIT);
+    printf("[CDC]   BUILD_TIME: %s\n", BUILD_TIME);
+    printf("[CDC]   BOARD_NAME: %s\n", BOARD_NAME);
+}
+
+void cdc_commands_process(const cdc_packet_t* packet)
+{
+    packet_handler(packet);
+}
+
+cdc_protocol_t* cdc_commands_get_protocol(void)
+{
+    return &protocol_ctx;
+}
+
+void cdc_commands_set_active_protocol(cdc_protocol_t* ctx)
+{
+    active_ctx = ctx ? ctx : &protocol_ctx;
+}
+
+void cdc_commands_send_input_event(uint32_t buttons, const uint8_t* axes)
+{
+    if (!stream_ctx || !stream_ctx->input_streaming) return;
+
+    // Throttle: only send when state changes or at ~60Hz max
+    // Prevents flooding CDC when pad_input polls at main loop rate (10kHz+)
+    static uint32_t last_buttons = 0xFFFFFFFF;
+    static uint8_t last_axes[7] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    static uint32_t last_send_ms = 0;
+
+    uint32_t now = platform_time_ms();
+    bool changed = (buttons != last_buttons || memcmp(axes, last_axes, 7) != 0);
+
+    uint32_t min_interval = stream_ctx->ble_transport ? 33 : 16;
+    if (!changed && (now - last_send_ms) < min_interval) return;
+
+    last_buttons = buttons;
+    memcpy(last_axes, axes, 7);
+    last_send_ms = now;
+
+    // Input axes from input_event_t (now contiguous):
+    // [0]=LX, [1]=LY, [2]=RX, [3]=RY, [4]=L2, [5]=R2, [6]=RZ
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"type\":\"input\",\"buttons\":%lu,\"axes\":[%d,%d,%d,%d,%d,%d,%d]}",
+             (unsigned long)buttons,
+             axes[0], axes[1], axes[2], axes[3], axes[4], axes[5], axes[6]);
+    cdc_protocol_send_event(stream_ctx, response_buf);
+}
+
+void cdc_commands_send_output_event(uint32_t buttons, const uint8_t* axes)
+{
+    if (!stream_ctx || !stream_ctx->input_streaming) return;
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"type\":\"output\",\"buttons\":%lu,\"axes\":[%d,%d,%d,%d,%d,%d,%d]}",
+             (unsigned long)buttons,
+             axes[0], axes[1], axes[2], axes[3], axes[4], axes[5], axes[6]);
+    cdc_protocol_send_event(stream_ctx, response_buf);
+}
+
+// Per-device streaming throttle (keyed by dev_addr, not player index)
+#define STREAM_MAX_DEVICES 8
+#define STREAM_MAX_PLAYERS 4
+
+typedef struct {
+    uint8_t dev_addr;
+    uint32_t buttons;
+    uint8_t axes[7];
+    uint32_t last_ms;
+} stream_throttle_t;
+
+static stream_throttle_t input_throttle[STREAM_MAX_DEVICES];
+static uint32_t last_po_buttons[STREAM_MAX_PLAYERS];
+static uint8_t  last_po_axes[STREAM_MAX_PLAYERS][7];
+static uint32_t last_po_ms[STREAM_MAX_PLAYERS];
+static bool stream_throttle_init = false;
+
+static void stream_throttle_reset(void) {
+    memset(input_throttle, 0, sizeof(input_throttle));
+    for (int i = 0; i < STREAM_MAX_DEVICES; i++) {
+        input_throttle[i].buttons = 0xFFFFFFFF;
+        memset(input_throttle[i].axes, 0xFF, 7);
+    }
+    memset(last_po_buttons, 0xFF, sizeof(last_po_buttons));
+    memset(last_po_axes, 0xFF, sizeof(last_po_axes));
+    memset(last_po_ms, 0, sizeof(last_po_ms));
+    stream_throttle_init = true;
+}
+
+static stream_throttle_t* get_input_throttle(uint8_t dev_addr) {
+    // Find existing slot
+    for (int i = 0; i < STREAM_MAX_DEVICES; i++) {
+        if (input_throttle[i].dev_addr == dev_addr && input_throttle[i].last_ms > 0)
+            return &input_throttle[i];
+    }
+    // Allocate new slot
+    for (int i = 0; i < STREAM_MAX_DEVICES; i++) {
+        if (input_throttle[i].last_ms == 0) {
+            input_throttle[i].dev_addr = dev_addr;
+            return &input_throttle[i];
+        }
+    }
+    return &input_throttle[0];  // fallback
+}
+
+bool cdc_commands_is_input_streaming(void) {
+    return stream_ctx && stream_ctx->input_streaming;
+}
+
+// (TX backlog gate moved into cdc_protocol_send_event so it applies
+// uniformly to ALL streaming events — input, output, connect, etc.
+// Command responses are NOT gated.)
+
+void cdc_commands_send_player_input(uint8_t player, uint8_t dev_addr,
+                                    const char* name, const char* source,
+                                    uint32_t buttons, const uint8_t* axes)
+{
+    if (!stream_ctx || !stream_ctx->input_streaming) return;
+    if (!stream_throttle_init) stream_throttle_reset();
+
+    stream_throttle_t* th = get_input_throttle(dev_addr);
+    uint32_t now = platform_time_ms();
+    uint32_t min_interval = stream_ctx->ble_transport ? 33 : 16;  // 30Hz BLE, 60Hz USB
+    bool changed = (buttons != th->buttons || memcmp(axes, th->axes, 7) != 0);
+    bool first = (th->buttons == 0xFFFFFFFF);
+    // Throttle UNCHANGED events only — button presses go through with
+    // single-iteration latency, idle/jitter capped to 60Hz.
+    if (!first && !changed && (now - th->last_ms) < min_interval) return;
+
+    if (first) {
+        // First event: include name/source for UI to cache
+        snprintf(response_buf, sizeof(response_buf),
+                 "{\"type\":\"input\",\"player\":%d,\"addr\":%d,\"name\":\"%.31s\",\"src\":\"%.8s\","
+                 "\"buttons\":%lu,\"axes\":[%d,%d,%d,%d,%d,%d,%d]}",
+                 player, dev_addr, name ? name : "", source ? source : "",
+                 (unsigned long)buttons,
+                 axes[0], axes[1], axes[2], axes[3], axes[4], axes[5], axes[6]);
+    } else {
+        // Compact array form: ["i",player,addr,buttons,"hex axes"]
+        // Worst case 39 chars + 7 framing = 46 bytes — fits in ONE 64-byte
+        // USB FS bulk packet, so each event is a single USB transfer.
+        // Multi-packet events (>57 bytes payload) get held by the host's
+        // CDC ACM aggregation timer waiting for "more data on the way",
+        // which is the actual cause of the streaming lag.
+        snprintf(response_buf, sizeof(response_buf),
+                 "[\"i\",%d,%d,%lu,\"%02X%02X%02X%02X%02X%02X%02X\"]",
+                 player, dev_addr, (unsigned long)buttons,
+                 axes[0], axes[1], axes[2], axes[3], axes[4], axes[5], axes[6]);
+    }
+    // Only commit the throttle state if the packet actually went out.
+    // If the protocol layer drops on backlog, we want to retry on the
+    // next poll instead of believing we've already sent the new state.
+    if (cdc_protocol_send_event(stream_ctx, response_buf) > 0) {
+        th->buttons = buttons;
+        memcpy(th->axes, axes, 7);
+        th->last_ms = now;
+    }
+}
+
+void cdc_commands_send_player_output(uint8_t player, uint32_t buttons,
+                                     const uint8_t* axes)
+{
+    if (!stream_ctx || !stream_ctx->input_streaming) return;
+    if (player >= STREAM_MAX_PLAYERS) return;
+    if (!stream_throttle_init) stream_throttle_reset();
+
+    uint32_t now = platform_time_ms();
+    uint32_t min_interval = stream_ctx->ble_transport ? 33 : 16;
+    bool changed = (buttons != last_po_buttons[player] ||
+                    memcmp(axes, last_po_axes[player], 7) != 0);
+    if (!changed && (now - last_po_ms[player]) < min_interval) return;
+
+    // Compact array form, fits in ONE USB packet.
+    snprintf(response_buf, sizeof(response_buf),
+             "[\"o\",%d,%lu,\"%02X%02X%02X%02X%02X%02X%02X\"]",
+             player, (unsigned long)buttons,
+             axes[0], axes[1], axes[2], axes[3], axes[4], axes[5], axes[6]);
+    // Only commit state if the packet actually went out (see input variant).
+    if (cdc_protocol_send_event(stream_ctx, response_buf) > 0) {
+        last_po_buttons[player] = buttons;
+        memcpy(last_po_axes[player], axes, 7);
+        last_po_ms[player] = now;
+    }
+}
+
+void cdc_commands_send_connect_event(uint8_t port, const char* name,
+                                     uint16_t vid, uint16_t pid)
+{
+    if (!stream_ctx) return;
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"type\":\"connect\",\"port\":%d,\"name\":\"%s\",\"vid\":%d,\"pid\":%d}",
+             port, name, vid, pid);
+    cdc_protocol_send_event(stream_ctx, response_buf);
+}
+
+void cdc_commands_send_disconnect_event(uint8_t port)
+{
+    if (!stream_ctx) return;
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"type\":\"disconnect\",\"port\":%d}", port);
+    cdc_protocol_send_event(stream_ctx, response_buf);
+}

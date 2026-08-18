@@ -1,0 +1,1845 @@
+<title>Point Blank</title>
+<!--
+  Controller silhouette traced from ControllerKeys by Kevin Tang
+  (https://github.com/NSEvent/xbox-controller-mapper), used under the
+  PolyForm Noncommercial License 1.0.0, which permits personal and hobby use.
+  Copyright (c) 2025-2026 Kevin Tang (https://kevintang.xyz)
+
+  The whole arrangement of this page follows that project: profiles standing in
+  a rail down the left, four tab groups over their sub-tabs, bindings shown as
+  callouts flanking the controller rather than behind a selection step, and a
+  caption under every value instead of a bare number. No code was taken.
+
+  Screens that are not built yet are present and dimmed rather than missing, so
+  the page says what it will become.
+-->
+<style>
+:root{
+  --ink:#ffffff; --dim:#98989d; --faint:#6a6a6e; --bg:#1c1c1e; --panel:#2c2c2e;
+  --sunk:#3a3a3c; --line:#3a3a3c; --raise:#48484a;
+  --point:#0a84ff; --press:#e0189c; --dbl:#0a84ff; --hold:#f0873a;
+  --scroll:#34c759; --click:#f0873a; --none:#48484a; --hot:#ff453a;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,system-ui,"Segoe UI",sans-serif;
+  -webkit-font-smoothing:antialiased}
+
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:13px 20px;
+  background:var(--bg);border-bottom:1px solid var(--line)}
+h1{font:600 15px/1 -apple-system,system-ui,sans-serif;letter-spacing:0;margin:0;color:var(--ink)}
+.spacer{flex:1}
+#status{font:12px ui-monospace,Menlo,monospace;color:var(--dim)}
+#status.on{color:var(--scroll)} #status.err{color:var(--hot)}
+
+/* Device pill: the app should say what it is talking to before anything else. */
+.devpill{display:flex;align-items:center;gap:8px;background:var(--panel);
+  border-radius:999px;padding:6px 14px;font-size:12.5px;font-weight:500}
+.devpill i{width:8px;height:8px;border-radius:50%;background:var(--faint)}
+.devpill.live i{background:var(--scroll)}
+
+button{font:500 12.5px/1 -apple-system,system-ui,sans-serif;color:var(--ink);
+  background:var(--sunk);border:0;padding:8px 13px;border-radius:6px;cursor:pointer}
+button:hover:not(:disabled){background:var(--raise)}
+button:disabled{opacity:.35;cursor:default}
+button.primary{background:var(--point);color:#fff}
+button.primary:hover:not(:disabled){background:#3d9bff}
+button.warn{background:var(--hold);color:#231202}
+button.warn:hover:not(:disabled){background:#ff9f4a}
+.gear{padding:8px 10px;font-size:14px;line-height:1}
+.gear.on{background:var(--point);color:#fff}
+
+.shell{display:grid;grid-template-columns:232px minmax(0,1fr);align-items:start}
+@media(max-width:900px){.shell{grid-template-columns:1fr}}
+.side{background:var(--bg);border-right:1px solid var(--line);padding:14px 12px;min-height:88vh}
+.main{padding:0 0 70px;display:flex;flex-direction:column;min-width:0}
+.h2{font:600 11px/1 -apple-system,system-ui,sans-serif;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--dim);margin:0 0 10px;
+  display:flex;align-items:center;gap:8px}
+.h2 .spacer{flex:1}
+.panel{background:var(--panel);border-radius:12px;padding:18px}
+
+/* Profiles: the rail is the navigation. Selecting one is how you change what
+   the whole page is about, exactly as in the app this follows. */
+.pcard{background:var(--panel);border-radius:9px;
+  padding:11px 12px;margin-bottom:7px;cursor:pointer}
+.pcard:hover{background:var(--sunk)}
+.pcard.live{background:#2f4f7a}
+.pcard.live:hover{background:#356093}
+.pcard .nm{font:600 13.5px/1.3 -apple-system,system-ui,sans-serif;color:var(--ink);
+  display:flex;align-items:center;gap:6px}
+.pcard .meta{font:11.5px/1.4 -apple-system,system-ui,sans-serif;color:var(--dim);margin-top:2px}
+.pcard.live .meta{color:#c9ddf5}
+.pcard.empty .nm{color:var(--faint);font-weight:400}
+.pcard .acts{display:flex;gap:5px;margin-top:9px}
+.pcard button{padding:4px 8px;font-size:11px;background:rgba(255,255,255,.12)}
+.pcard button:hover{background:rgba(255,255,255,.22)}
+#presetName{width:100%;background:var(--panel);border:0;color:var(--ink);
+  border-radius:7px;padding:8px 10px;font:12.5px -apple-system,system-ui,sans-serif;
+  margin-bottom:6px}
+#presetName::placeholder{color:var(--faint)}
+
+/* Tabs: four groups over their sub-tabs, both rows always visible so the shape
+   of the whole thing is legible from any screen. */
+.tabs{display:flex;gap:4px;padding:12px 20px 0;flex-wrap:wrap}
+.tab{display:flex;align-items:center;gap:8px;background:transparent;border:0;
+  border-radius:8px;padding:9px 14px;font:600 13.5px/1 -apple-system,system-ui,sans-serif;
+  color:var(--dim)}
+.tab:hover:not(.on){background:var(--panel)}
+.tab.on{background:var(--panel);color:var(--ink)}
+.tab .ct{font:11px -apple-system,system-ui,sans-serif;font-weight:600;
+  background:var(--sunk);color:var(--dim);border-radius:9px;padding:2px 7px}
+.tab.on .ct{background:var(--raise);color:var(--ink)}
+.subtabs{display:flex;gap:3px;margin:10px 20px 0;padding:5px;background:var(--panel);
+  border-radius:9px;flex-wrap:wrap}
+.subtab{display:flex;align-items:center;gap:6px;background:transparent;border:0;
+  border-radius:6px;padding:7px 13px;font:600 12.5px/1 -apple-system,system-ui,sans-serif;
+  color:var(--dim)}
+.subtab:hover:not(.on){background:var(--sunk)}
+.subtab.on{background:var(--point);color:#fff}
+.subtab.soon{color:var(--faint)}
+.subtab.soon.on{background:var(--raise);color:var(--dim)}
+
+.screens{padding:18px 20px 0;display:flex;flex-direction:column;gap:20px;min-width:0}
+.screen{display:none;flex-direction:column;gap:20px}
+.screen.on{display:flex}
+
+/* Their per-screen pattern: a heading standing outside a card of rows. */
+.sect{font:600 15px/1 -apple-system,system-ui,sans-serif;color:var(--ink);margin:4px 0 10px}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start}
+@media(max-width:1000px){.cols{grid-template-columns:1fr}}
+
+/* Every value carries a caption. A bare number does not say what it measures. */
+.set{border-bottom:1px solid rgba(255,255,255,.07);padding:12px 0}
+.set:last-child{border-bottom:0}
+.set .top{display:flex;align-items:baseline;gap:10px}
+.set .nm{flex:1;font:13.5px -apple-system,system-ui,sans-serif}
+.set .vl{font:13px -apple-system,system-ui,sans-serif;color:var(--dim);font-weight:500}
+.set input[type=range]{width:100%;accent-color:var(--point);margin:9px 0 0}
+.set .cap{font:11.5px/1.45 -apple-system,system-ui,sans-serif;color:var(--faint);margin-top:5px}
+.seg{display:flex;gap:2px;background:var(--sunk);border-radius:7px;padding:2px}
+.seg button{flex:1;border:0;border-radius:5px;background:transparent;padding:6px 6px;
+  font-size:12px;font-weight:500;color:var(--dim)}
+.seg button:hover:not(.on){background:var(--raise);color:var(--ink)}
+.seg button.on{background:var(--point);color:#fff;font-weight:600}
+
+/* Switches rather than bare checkboxes, so a row reads at a glance. */
+.sw{position:relative;display:inline-block;width:40px;height:24px;flex:0 0 auto}
+.sw input{opacity:0;width:0;height:0}
+.sw span{position:absolute;inset:0;background:var(--none);border-radius:12px;
+  transition:background .15s;cursor:pointer}
+.sw span::before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;
+  background:#fff;border-radius:50%;transition:transform .15s}
+.sw input:checked+span{background:var(--point)}
+.sw input:checked+span::before{transform:translateX(16px)}
+.sw input:disabled+span{opacity:.4;cursor:default}
+.swrow{display:flex;align-items:center;gap:12px}
+.swrow .nm{flex:1}
+
+/* The layer row, above everything, exactly where theirs sits. */
+.layers{display:flex;align-items:center;gap:8px;background:var(--panel);border-radius:10px;
+  padding:8px 10px;margin-bottom:12px}
+.layer{display:flex;align-items:center;gap:7px;border-radius:7px;padding:7px 14px;
+  background:var(--sunk);color:var(--dim);font:600 12.5px/1 -apple-system,system-ui,sans-serif}
+.layer.on{background:var(--point);color:#fff}
+
+/* Press a button on the controller to select it, rather than hunting the
+   diagram with a cursor. The stream is already flowing; this only listens. */
+.strip{display:flex;align-items:center;gap:11px;background:var(--panel);
+  border-radius:10px;padding:14px 16px;margin-bottom:12px}
+.strip .lb{font:500 12.5px/1 -apple-system,system-ui,sans-serif;color:var(--faint)}
+.strip .now{flex:1;font:13px -apple-system,system-ui,sans-serif;color:var(--faint);
+  text-align:center}
+.strip .now.hit{color:var(--ink);font-weight:600}
+
+/* Bindings as cards positioned around the controller, in the arrangement the
+   controls actually have in the hand. Not a list: the d-pad group is laid out
+   as a d-pad, and the middle column carries the touchpad above the controller
+   and the system buttons below it. */
+.maprow{display:grid;grid-template-columns:minmax(210px,1fr) minmax(330px,1.25fr) minmax(210px,1fr);
+  gap:26px;align-items:start}
+@media(max-width:1180px){.maprow{grid-template-columns:1fr}}
+.grp{margin-bottom:22px}
+.grp .gh{display:flex;align-items:center;gap:8px;
+  font:600 11px/1 -apple-system,system-ui,sans-serif;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--faint);margin:0 0 9px}
+.grp .gh .spacer{flex:1}
+.grp .gh .pick{font-size:11.5px;color:var(--dim);text-transform:none;letter-spacing:0}
+
+.bind{display:flex;align-items:flex-start;gap:9px;margin-bottom:9px;min-width:0}
+/* The control itself, as a glyph, the way the app this follows draws them. */
+.glyph{flex:0 0 auto;min-width:38px;height:34px;padding:0 9px;border-radius:8px;
+  background:var(--sunk);color:var(--dim);display:flex;align-items:center;justify-content:center;
+  font:600 12px/1 -apple-system,system-ui,sans-serif;cursor:pointer;
+  transition:background .08s,color .08s}
+.glyph.round{border-radius:50%;width:34px;min-width:34px;padding:0;font-size:14px}
+.glyph:hover{background:var(--raise);color:var(--ink)}
+.glyph.lit{background:#fff;color:#1c1c1e}
+/* One card per control. Stage 1 holds a single row; the shape is here so
+   press, double and hold can stack inside it without a redesign. */
+.bcard{flex:1;min-width:0;background:var(--sunk);border-radius:9px;padding:5px;
+  border:1.5px solid transparent}
+.bind.sel .bcard{border-color:var(--point)}
+/* Pressed right now. The card the eye is already on is the one that reacts. */
+.bind.down .bcard{background:#0a3d6e}
+.bind.down .brow .val{color:#fff}
+.brow{display:flex;align-items:center;gap:8px;width:100%;background:transparent;border:0;
+  border-radius:6px;padding:7px 9px;cursor:pointer;text-align:left}
+.brow:hover{background:var(--raise)}
+.brow .val{flex:1;min-width:0;font:600 13px/1.25 -apple-system,system-ui,sans-serif;
+  color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.brow .val.off{color:var(--faint);font-weight:400}
+.badge{flex:0 0 auto;width:22px;height:20px;border-radius:5px;display:flex;
+  align-items:center;justify-content:center;color:#fff;
+  font:700 9.5px/1 -apple-system,system-ui,sans-serif}
+.badge.press{background:var(--press)}
+.badge.dbl{background:var(--dbl)}
+.badge.hold{background:var(--hold)}
+.badge.g{background:var(--raise);color:var(--dim)}
+
+/* Choosing an action is a menu on the card, not a dropdown sitting in the row.
+   A row should read as what it does, not as a control waiting to be used. */
+.pop{position:absolute;z-index:80;background:#333335;border-radius:10px;padding:5px;
+  min-width:190px;max-height:340px;overflow:auto;
+  box-shadow:0 14px 40px rgba(0,0,0,.6),0 0 0 1px rgba(255,255,255,.09)}
+.pop button{display:block;width:100%;text-align:left;background:transparent;
+  border-radius:6px;padding:8px 11px;font:13px -apple-system,system-ui,sans-serif;
+  color:var(--ink);font-weight:400}
+.pop button:hover{background:var(--point);color:#fff}
+.pop button.on{font-weight:600}
+.pop button.on::after{content:"  ✓";color:var(--point)}
+.pop button.on:hover::after{color:#fff}
+
+/* The controller, ported from their vector art. Neutral, as theirs is: the
+   cards beside it already say what each control does, so colouring the body
+   by binding family would only repeat them. */
+svg .body{fill:url(#gBody);stroke:#b4b4b9;stroke-width:2}
+svg .deck{fill:url(#gDeck)}
+svg .bar{fill:url(#gBar)}
+svg .well{fill:#0a0a0c}
+svg .cap{fill:#1c1c20;stroke:#3a3a40;stroke-width:1.5;pointer-events:none}
+svg .hole{fill:#3a3a40;pointer-events:none}
+svg .mute{fill:#141418;pointer-events:none}
+svg .ctl{transition:fill .08s,stroke .08s;cursor:pointer;stroke:transparent;stroke-width:0}
+svg .trig{fill:#c3c3c8} svg .bump{fill:#dcdce0}
+svg .pad{fill:url(#gPad)}
+svg .small{fill:#9d9da4} svg .face{fill:#f2f2f4;stroke:#c0c0c6;stroke-width:1.5}
+svg .stick{fill:#0f0f12} svg .ps{fill:#c9c9ce}
+svg .lit{fill:#0a84ff !important;stroke:#0a84ff;stroke-width:5}
+svg .pick{stroke:#0a84ff;stroke-width:4}
+svg text{fill:#8e8e93;font:13px -apple-system,system-ui,sans-serif;text-anchor:middle;
+  pointer-events:none}
+svg .lbl{fill:#5c5c63;font-weight:600;font-size:15px}
+svg .lbl.dark{fill:#48484d}
+svg .tiny{fill:#8e8e93;font-size:14px}
+svg .glyph{fill:#7c7c84;font-size:26px;font-weight:500}
+svg .glyph.small{fill:#5c5c63;font-size:14px;font-weight:700}
+svg .battbox{fill:#30d158} svg .battxt{fill:#08240f;font-size:14px;font-weight:700}
+.readout{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:12px;
+  font:11px -apple-system,system-ui,sans-serif;color:var(--faint)}
+.readout div{background:var(--sunk);border-radius:7px;padding:7px 9px}
+.readout b{display:block;color:var(--ink);font-weight:600;font-size:13.5px;margin-top:2px}
+
+/* Chord rows, in their format: the buttons, an arrow, what it does. */
+.crow{display:flex;align-items:center;gap:10px;padding:11px 13px;
+  border-radius:9px;background:var(--panel);margin-bottom:7px;font-size:13px}
+.crow code{background:var(--sunk);border-radius:6px;padding:5px 10px;
+  font:600 11.5px/1 -apple-system,system-ui,sans-serif;color:var(--ink);white-space:nowrap}
+.crow .ar{color:var(--faint)}
+.crow .ds{color:var(--dim)}
+
+.note{font-size:12.5px;color:var(--faint);line-height:1.55;margin:12px 0 0}
+.rowbtns{display:flex;gap:8px;margin-top:16px;flex-wrap:wrap}
+.unsupported{background:#3a1a18;color:#ffb4ab;padding:12px 14px;
+  border-radius:9px;margin:18px 20px 0;font-size:13px;display:none}
+
+/* Not built yet. Present and dimmed, because a missing tab says nothing and a
+   dimmed one says what is coming. */
+.soonbox{border-radius:12px;padding:24px;background:var(--panel)}
+.soonbox .t{font:600 15px/1.3 -apple-system,system-ui,sans-serif;color:var(--dim);
+  margin-bottom:8px}
+.soonbox .d{font-size:13px;line-height:1.6;color:var(--faint);max-width:62ch}
+.soonbox .w{display:inline-block;margin-top:14px;
+  font:600 11px/1 -apple-system,system-ui,sans-serif;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--dim);
+  background:var(--sunk);border-radius:6px;padding:6px 10px}
+
+.fwnow{display:flex;gap:22px;flex-wrap:wrap;padding:12px 14px;background:var(--sunk);
+  border-radius:9px;margin-bottom:14px}
+.fwnow .k{display:block;font:600 10.5px/1 -apple-system,system-ui,sans-serif;color:var(--faint);
+  text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}
+.fwnow .v{font-size:13px;color:var(--ink);font-weight:600}
+.steps{margin-top:16px;display:flex;flex-direction:column;gap:0}
+.step{display:flex;align-items:center;gap:12px;padding:11px 0;border-top:1px solid var(--line)}
+.step .sn{flex:0 0 22px;height:22px;border-radius:11px;background:var(--sunk);
+  display:flex;align-items:center;justify-content:center;
+  font:600 11px/1 -apple-system,system-ui,sans-serif;color:var(--faint)}
+.step .sb{flex:1;min-width:0}
+.step .st{font:13.5px -apple-system,system-ui,sans-serif;color:var(--dim)}
+.step .sc{font:11.5px/1.45 -apple-system,system-ui,sans-serif;color:var(--faint);margin-top:3px}
+.step.now .sn{background:var(--point);color:#fff}
+.step.now .st{color:var(--ink);font-weight:600}
+.step.done .sn{background:var(--scroll);color:#08240f;font-weight:700}
+.step.done .st{color:var(--dim)}
+.step{border-top:1px solid rgba(255,255,255,.07)}
+#fw-state{color:var(--point)}
+.fwsrc{font:600 10.5px/1 -apple-system,system-ui,sans-serif;color:var(--faint);
+  text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
+.fwlist{display:flex;flex-direction:column;gap:7px}
+.fwrow .nmwrap{flex:0 0 auto;min-width:210px}
+.fwrow .mt{font:11px -apple-system,system-ui,sans-serif;color:var(--faint);margin-top:3px}
+#fwPanel.drop{box-shadow:inset 0 0 0 2px var(--point)}
+.fwrow{display:flex;align-items:center;gap:11px;padding:10px 12px;
+  border-radius:9px;background:var(--sunk);border:1.5px solid transparent}
+.fwrow.here{border-color:var(--point)}
+.fwrow .nm{font:12.5px -apple-system,system-ui,sans-serif;color:var(--ink);
+  white-space:nowrap;font-weight:500}
+.fwrow .ds{font-size:12.5px;color:var(--dim);flex:1;line-height:1.45}
+.fwrow .tag{font:600 10.5px/1 -apple-system,system-ui,sans-serif;color:var(--point);
+  text-transform:uppercase;letter-spacing:.07em;white-space:nowrap}
+.fwrow button{padding:6px 12px}
+</style>
+
+<header>
+  <h1>Point Blank</h1>
+  <span class="devpill" id="devpill"><i></i><span id="devname">no controller</span></span>
+  <span class="spacer"></span>
+  <span id="status">not connected</span>
+  <button id="connect" class="primary">Connect</button>
+  <button id="gear" class="gear" title="Identity and firmware">&#9881;</button>
+</header>
+
+<div class="unsupported" id="nows">
+  No Web Serial in this browser. Use Chrome or Edge.
+</div>
+
+<div class="shell">
+ <aside class="side">
+   <p class="h2">Profiles<span class="spacer"></span></p>
+   <div id="presetList"></div>
+   <input id="presetName" placeholder="new profile name" maxlength="11">
+   <button id="presetSave" style="width:100%" disabled>Save current as new</button>
+   <p class="note">
+     Each holds the feel, every assignment and both modes. Saved on the board,
+     so it travels with the dongle. Names stop at eleven characters, which is
+     what the firmware stores.
+   </p>
+ </aside>
+
+ <main class="main">
+  <div class="tabs" id="tabs"></div>
+  <div class="subtabs" id="subtabs"></div>
+
+  <div class="screens">
+
+   <!-- ==================== MAP > BUTTONS ==================== -->
+   <section class="screen" data-screen="buttons">
+    <div>
+     <div class="layers">
+       <span class="layer on">Base</span>
+       <button class="layer" id="addLayer" disabled title="Layers need the firmware schema change">+ Add Layer</button>
+       <span class="spacer" style="flex:1"></span>
+       <label class="swrow" style="gap:9px">
+         <span class="lb" style="font:500 12.5px/1 -apple-system,system-ui,sans-serif;color:var(--dim)">Press to select</span>
+         <span class="sw"><input type="checkbox" id="t-pick" checked><span></span></span>
+       </label>
+     </div>
+     <div class="strip">
+       <span class="lb">Timeline</span>
+       <span class="lb" id="r-n" title="packets received">0</span>
+       <span class="now" id="strip-now">Waiting for input</span>
+       <span class="lb" id="strip-batt"></span>
+     </div>
+     <div class="panel">
+      <div class="maprow">
+       <div id="colL"></div>
+       <div>
+        <div id="colMTop"></div>
+        <div class="seg" id="seg-pad" style="max-width:280px;margin:0 auto 10px">
+          <button data-v="ds5">DualSense</button>
+          <button data-v="jc">Joy-Con</button>
+        </div>
+        <svg id="pad" viewBox="-30 -14 1060 700" width="100%" role="img"
+     aria-label="DualSense controller, lit as you press">
+  <defs>
+    <linearGradient id="gBody" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fafafa"/><stop offset="1" stop-color="#cbcbcf"/>
+    </linearGradient>
+    <linearGradient id="gDeck" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#212124"/><stop offset="1" stop-color="#0d0d0f"/>
+    </linearGradient>
+    <linearGradient id="gPad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ccd6f2"/><stop offset="1" stop-color="#aab8e0"/>
+    </linearGradient>
+    <linearGradient id="gBar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4080ff"/><stop offset="1" stop-color="#2659f2"/>
+    </linearGradient>
+  </defs>
+  <rect class="ctl trig" id="c-6" x="107.0" y="-9.4" width="116" height="30" rx="13"/>
+  <text class="lbl" x="165.0" y="10.6">L2</text>
+  <rect class="ctl trig" id="c-7" x="777.0" y="-9.4" width="116" height="30" rx="13"/>
+  <text class="lbl" x="835.0" y="10.6">R2</text>
+  <path class="body" d="M195.5 14.4 C166.3 19.6 143.4 31.3 134.2 45.4 C130.8 50.7 124.4 58.0 119.9 61.9 C87.6 89.4 30.6 271.4 17.6 387.9 C0.0 546.7 27.0 639.2 94.2 649.0 C102.7 650.3 114.7 652.3 120.6 653.5 C157.1 660.4 157.8 659.4 215.1 509.1 C239.9 444.0 267.7 423.5 320.8 431.0 C345.2 434.5 654.8 434.5 679.2 431.0 C732.8 423.4 760.0 443.9 785.6 511.2 C841.7 658.4 843.0 660.4 879.4 653.5 C885.3 652.3 897.3 650.3 905.8 649.0 C973.0 639.2 1000.0 546.7 982.4 387.9 C969.4 271.4 912.4 89.4 880.1 61.9 C875.6 58.0 869.2 50.7 865.8 45.4 C845.1 13.5 762.4 0.0 738.7 24.5 C727.9 35.8 728.8 35.7 685.9 29.6 C635.7 22.4 580.5 19.3 500.0 19.3 C419.5 19.3 364.3 22.4 314.1 29.6 C271.2 35.7 272.1 35.8 261.3 24.5 C249.1 11.8 227.6 8.5 195.5 14.4 Z"/>
+  <rect class="ctl bump" id="c-4" x="145.0" y="16.7" width="110" height="26" rx="11"/>
+  <text class="lbl dark" x="200.0" y="33.7">L1</text>
+  <rect class="ctl bump" id="c-5" x="745.0" y="16.7" width="110" height="26" rx="11"/>
+  <text class="lbl dark" x="800.0" y="33.7">R1</text>
+  <path class="deck" d="M262.0 284.0 C285.0 244.3 325.0 194.8 355.0 178.3 L645.0 178.3 C675.0 194.8 715.0 244.3 738.0 284.0 C755.0 313.7 745.0 346.7 715.0 373.1 C665.0 419.4 585.0 435.9 500.0 435.9 C415.0 435.9 335.0 419.4 285.0 373.1 C255.0 346.7 245.0 313.7 262.0 284.0 Z"/>
+  <path class="bar" d="M330.0 56.1 Q330.0 138.7 338.0 221.2 L358.0 217.9 Q342.0 138.7 342.0 59.4 Z"/>
+  <path class="bar" d="M670.0 56.1 Q670.0 138.7 662.0 221.2 L642.0 217.9 Q658.0 138.7 658.0 59.4 Z"/>
+  <path class="ctl pad" id="c-17" d="M345.0 49.5 L655.0 49.5 Q665.0 49.5 665.0 59.5 L651.0 211.2 Q651.0 221.2 641.0 221.2 L359.0 221.2 Q349.0 221.2 349.0 211.2 L335.0 59.5 Q335.0 49.5 345.0 49.5 Z"/>
+  <rect class="ctl small" id="c-8" x="284.0" y="70.2" width="22" height="18" rx="4"/>
+  <text class="tiny" x="295.0" y="64.2">create</text>
+  <rect class="ctl small" id="c-9" x="694.0" y="70.2" width="22" height="18" rx="4"/>
+  <text class="tiny" x="705.0" y="64.2">options</text>
+  <rect class="ctl small" id="c-12" x="175.4" y="120.8" width="39.2" height="52.2" rx="4"/>
+  <rect class="ctl small" id="c-13" x="175.4" y="177.0" width="39.2" height="52.2" rx="4"/>
+  <rect class="ctl small" id="c-14" x="140.8" y="155.4" width="52.2" height="39.2" rx="4"/>
+  <rect class="ctl small" id="c-15" x="197.0" y="155.4" width="52.2" height="39.2" rx="4"/>
+  <circle class="ctl face" id="c-3" cx="805.0" cy="119.0" r="29.0"/>
+  <text class="glyph" x="805.0" y="127.0">△</text>
+  <circle class="ctl face" id="c-1" cx="861.0" cy="175.0" r="29.0"/>
+  <text class="glyph" x="861.0" y="183.0">◯</text>
+  <circle class="ctl face" id="c-0" cx="805.0" cy="231.0" r="29.0"/>
+  <text class="glyph" x="805.0" y="239.0">✕</text>
+  <circle class="ctl face" id="c-2" cx="749.0" cy="175.0" r="29.0"/>
+  <text class="glyph" x="749.0" y="183.0">□</text>
+  <circle class="well" cx="385.0" cy="313.7" r="72.5"/>
+  <circle class="ctl stick" id="c-10" cx="385.0" cy="313.7" r="53.6"/>
+  <circle class="cap" id="dot-L" cx="385.0" cy="313.7" r="21.8"/>
+  <text class="tiny" id="lbl-L" x="385.0" y="404.2">pointer</text>
+  <circle class="well" cx="615.0" cy="313.7" r="72.5"/>
+  <circle class="ctl stick" id="c-11" cx="615.0" cy="313.7" r="53.6"/>
+  <circle class="cap" id="dot-R" cx="615.0" cy="313.7" r="21.8"/>
+  <text class="tiny" id="lbl-R" x="615.0" y="404.2">pointer</text>
+  <circle class="hole" cx="468.0" cy="250.3" r="1.6"/>
+  <circle class="hole" cx="476.0" cy="250.3" r="1.6"/>
+  <circle class="hole" cx="484.0" cy="250.3" r="1.6"/>
+  <circle class="hole" cx="492.0" cy="250.3" r="1.6"/>
+  <circle class="hole" cx="500.0" cy="250.3" r="1.6"/>
+  <circle class="hole" cx="508.0" cy="250.3" r="1.6"/>
+  <circle class="hole" cx="516.0" cy="250.3" r="1.6"/>
+  <circle class="hole" cx="524.0" cy="250.3" r="1.6"/>
+  <circle class="hole" cx="532.0" cy="250.3" r="1.6"/>
+  <circle class="hole" cx="472.0" cy="258.3" r="1.6"/>
+  <circle class="hole" cx="480.0" cy="258.3" r="1.6"/>
+  <circle class="hole" cx="488.0" cy="258.3" r="1.6"/>
+  <circle class="hole" cx="496.0" cy="258.3" r="1.6"/>
+  <circle class="hole" cx="504.0" cy="258.3" r="1.6"/>
+  <circle class="hole" cx="512.0" cy="258.3" r="1.6"/>
+  <circle class="hole" cx="520.0" cy="258.3" r="1.6"/>
+  <circle class="hole" cx="528.0" cy="258.3" r="1.6"/>
+  <circle class="hole" cx="536.0" cy="258.3" r="1.6"/>
+  <circle class="ctl ps" id="c-16" cx="500.0" cy="330.2" r="26.0"/>
+  <text class="glyph small" x="500.0" y="334.2">PS</text>
+  <rect class="mute" x="489.0" y="379.3" width="22" height="14" rx="4"/>
+  <g id="battwrap" style="display:none">
+    <rect class="battbox" id="battbox" x="474.0" y="583.4" width="52" height="22" rx="6"/>
+    <text class="battxt" id="batt-t" x="500.0" y="598.4">--</text>
+  </g>
+</svg>
+        <div class="readout">
+          <div>right stick<b id="r-rs">0, 0</b></div>
+          <div>left stick<b id="r-ls">0, 0</b></div>
+          <div>triggers<b id="r-trig">0, 0</b></div>
+          <div>pressed<b id="r-btn">none</b></div>
+        </div>
+        <div id="colMBot" style="margin-top:20px"></div>
+       </div>
+       <div id="colR"></div>
+      </div>
+      <div class="rowbtns">
+        <button id="mapReset" disabled>Reset bindings</button>
+      </div>
+     </div>
+    </div>
+   </section>
+
+   <!-- ==================== MAP > CHORDS ==================== -->
+   <section class="screen" data-screen="chords">
+    <div>
+     <p class="sect">Built in</p>
+     <div class="crow"><code>Options</code><code>Cross</code>
+       <span class="ar">&rarr;</span><span class="ds">Step through stick modes</span></div>
+     <div class="crow"><code>Options</code><code>Square</code>
+       <span class="ar">&rarr;</span><span class="ds">Step through touchpad modes</span></div>
+     <div class="crow"><code>Options</code><code>Circle</code>
+       <span class="ar">&rarr;</span><span class="ds">Step through saved profiles</span></div>
+     <p class="note">
+       These are compiled into the firmware and cannot be changed here yet. The
+       controller buzzes on each change, since a mode switch you cannot see needs
+       some acknowledgement. While Options is held nothing fires its normal
+       action, so the chord does not click on the way past.
+     </p>
+    </div>
+    <div>
+     <p class="sect">Your own</p>
+     <div class="soonbox">
+      <div class="t">Chords you can edit are not built yet</div>
+      <div class="d">Pressing several buttons at once to fire one action needs the
+        board to store chords as data rather than compile them in. That is the same
+        storage change the stacked bindings need, so it lands with them.</div>
+      <div class="w">needs firmware</div>
+     </div>
+    </div>
+   </section>
+
+   <!-- ==================== MAP > SEQUENCES ==================== -->
+   <section class="screen" data-screen="sequences">
+    <div class="soonbox">
+     <div class="t">Sequences are not built yet</div>
+     <div class="d">One button after another firing a single action, rather than
+       both at once. Shares the chord storage, and follows it.</div>
+     <div class="w">needs firmware</div>
+    </div>
+   </section>
+
+   <!-- ==================== MAP > GESTURES ==================== -->
+   <section class="screen" data-screen="gestures">
+    <div class="soonbox">
+     <div class="t">Gestures are not built yet</div>
+     <div class="d">Swipes and corners of the touchpad acting as triggers in their
+       own right. The pad already reports absolute finger position, so this is
+       firmware work rather than new hardware.</div>
+     <div class="w">needs firmware</div>
+    </div>
+   </section>
+
+   <!-- ==================== AUTOMATE > MACROS ==================== -->
+   <section class="screen" data-screen="macros">
+    <div class="soonbox">
+     <div class="t">Macros are not built yet</div>
+     <div class="d">A chain of key presses, typed text and pauses on one button.
+       Text is bulky, so this needs its own area of flash on the board.</div>
+     <div class="w">needs firmware</div>
+    </div>
+   </section>
+
+   <!-- ==================== AUTOMATE > SCRIPTS ==================== -->
+   <section class="screen" data-screen="scripts">
+    <div class="soonbox">
+     <div class="t">Scripts cannot work here</div>
+     <div class="d">Running a script means running it on the Mac. This dongle is a
+       USB mouse and nothing on the other machine knows it exists, which is the
+       entire point of it. Nothing to build.</div>
+     <div class="w">not possible on the board</div>
+    </div>
+   </section>
+
+   <!-- ==================== AUTOMATE > WHEEL ==================== -->
+   <section class="screen" data-screen="wheel">
+    <div class="soonbox">
+     <div class="t">The command wheel cannot work here</div>
+     <div class="d">A radial menu has to be drawn over whatever you are looking at.
+       The board can send pointer and key reports; it cannot put anything on the
+       screen.</div>
+     <div class="w">not possible on the board</div>
+    </div>
+   </section>
+
+   <!-- ==================== AUTOMATE > KEYBOARD ==================== -->
+   <section class="screen" data-screen="keyboard">
+    <div class="soonbox">
+     <div class="t">The on-screen keyboard cannot work here</div>
+     <div class="d">Same reason as the wheel: it is something drawn on the Mac.
+       The board can type, but it cannot show you a keyboard to aim at.</div>
+     <div class="w">not possible on the board</div>
+    </div>
+   </section>
+
+   <!-- ==================== HARDWARE > INPUT ==================== -->
+   <section class="screen" data-screen="input">
+    <div class="soonbox">
+     <div class="t">Button timing is not adjustable yet</div>
+     <div class="d">There is a choice to expose here once chords are data: wait a
+       moment on every press so a chord can still win, or fire plain buttons the
+       instant they go down and keep chords on the slower path. Today the firmware
+       picks for you.</div>
+     <div class="w">needs firmware</div>
+    </div>
+   </section>
+
+   <!-- ==================== HARDWARE > JOYSTICKS ==================== -->
+   <section class="screen" data-screen="joysticks">
+    <div>
+     <p class="sect">Sticks</p>
+     <div class="panel">
+      <div class="set">
+        <div class="top"><span class="nm">Roles</span></div>
+        <div class="seg" id="seg-stick" style="margin-top:7px">
+          <button data-v="0">Right points</button>
+          <button data-v="1">Left points</button>
+          <button data-v="2">Both point</button>
+        </div>
+        <div class="cap">Whichever stick is not pointing does the scrolling.
+          Both point gives you a coarse thumb and a fine one.</div>
+      </div>
+      <div class="set" id="row-fine">
+        <div class="top"><span class="nm">Fine stick</span><span class="vl" id="v-fine">-</span></div>
+        <input type="range" id="s-fine" min="1" max="100" step="1">
+        <div class="cap">Second stick speed, as a share of the first. Only used
+          when both point.</div>
+      </div>
+     </div>
+    </div>
+
+    <div class="cols">
+     <div>
+      <p class="sect">Speed</p>
+      <div class="panel">
+       <div class="set">
+         <div class="top"><span class="nm">Pointer</span><span class="vl" id="v-speed">-</span></div>
+         <input type="range" id="s-speed" min="200" max="12000" step="50">
+         <div class="cap">Pixels per second at full push. Reads high because
+           macOS scales raw movement to about a third on the way to the cursor.</div>
+       </div>
+       <div class="set">
+         <div class="top"><span class="nm">Pointer curve</span><span class="vl" id="v-curve">-</span></div>
+         <input type="range" id="s-curve" min="0" max="100" step="1">
+         <div class="cap">0 is cubic, finest control near centre. 100 is squared,
+           quicker to get moving.</div>
+       </div>
+       <div class="set">
+         <div class="top"><span class="nm">Precision hold</span><span class="vl" id="v-prec">-</span></div>
+         <input type="range" id="s-prec" min="5" max="200" step="5">
+         <div class="cap">Speed while the precision control is held.</div>
+       </div>
+       <div class="set">
+         <div class="top"><span class="nm">Turbo hold</span><span class="vl" id="v-turbo">-</span></div>
+         <input type="range" id="s-turbo" min="50" max="255" step="5">
+         <div class="cap">Speed while the turbo control is held.</div>
+       </div>
+      </div>
+     </div>
+
+     <div>
+      <p class="sect">Scroll</p>
+      <div class="panel">
+       <div class="set">
+         <div class="top"><span class="nm">Up and down</span><span class="vl" id="v-sv">-</span></div>
+         <input type="range" id="s-sv" min="0" max="60" step="1">
+         <div class="cap">Wheel clicks per second at full push. macOS has no
+           finer step than one line for an ordinary USB wheel.</div>
+       </div>
+       <div class="set">
+         <div class="top"><span class="nm">Sideways</span><span class="vl" id="v-sh">-</span></div>
+         <input type="range" id="s-sh" min="0" max="60" step="1">
+         <div class="cap">Set to zero to stop sideways scrolling entirely.</div>
+       </div>
+       <div class="set">
+         <div class="top"><span class="nm">Scroll curve</span><span class="vl" id="v-scurve">-</span></div>
+         <input type="range" id="s-scurve" min="0" max="100" step="1">
+         <div class="cap">Squarer than the pointer by default, because a
+           quantised wheel feels dead if it starts too slowly.</div>
+       </div>
+       <div class="set">
+         <div class="swrow"><span class="nm">Natural, vertical</span>
+           <span class="sw"><input type="checkbox" id="t-invv"><span></span></span></div>
+       </div>
+       <div class="set">
+         <div class="swrow"><span class="nm">Flip sideways</span>
+           <span class="sw"><input type="checkbox" id="t-invh"><span></span></span></div>
+       </div>
+      </div>
+     </div>
+    </div>
+
+    <div>
+     <p class="sect">Speed dial</p>
+     <div class="panel">
+      <div class="set">
+        <div class="top"><span class="nm">Trigger</span></div>
+        <div class="seg" id="seg-dial" style="margin-top:7px">
+          <button data-v="0">Off</button>
+          <button data-v="1">L2</button>
+          <button data-v="2">R2</button>
+        </div>
+        <div class="cap">The triggers are analogue, so this slides speed
+          continuously as you squeeze rather than switching at a threshold. A
+          trigger used this way stops clicking, and its click moves to the
+          bumper above it.</div>
+      </div>
+      <div class="set">
+        <div class="top"><span class="nm">At full squeeze</span><span class="vl" id="v-dial">-</span></div>
+        <input type="range" id="s-dial" min="5" max="400" step="5">
+        <div class="cap">Speed at the bottom of the trigger travel. Under 100
+          slows down for precision, over 100 speeds up.</div>
+      </div>
+     </div>
+    </div>
+
+    <div>
+     <p class="sect">Gyro</p>
+     <div class="panel">
+      <div class="set">
+        <div class="top"><span class="nm">Mode</span></div>
+        <div class="seg" id="seg-gyro" style="margin-top:7px">
+          <button data-v="0">Off</button>
+          <button data-v="1">Fixed grip</button>
+          <button data-v="2">Any angle</button>
+        </div>
+        <div class="cap">Any angle finds gravity with the accelerometer and
+          measures turning about it, so how you hold the controller stops
+          mattering. Use it if the controller is on its end, tipped forward, or
+          moving with you. Fixed grip is cheaper but only correct for the grip
+          you declare below.</div>
+      </div>
+      <div class="set" id="row-orient">
+        <div class="top"><span class="nm">Grip</span></div>
+        <div class="seg" id="seg-orient" style="margin-top:7px">
+          <button data-v="0">Flat</button>
+          <button data-v="1">On end</button>
+          <button data-v="2">Face down</button>
+        </div>
+        <div class="cap">Only read in fixed grip mode. On end is the one-handed
+          hold, pointing away from you like a remote.</div>
+      </div>
+      <div class="set">
+        <div class="top"><span class="nm">When live</span></div>
+        <div class="seg" id="seg-gate" style="margin-top:7px">
+          <button data-v="0">Always</button>
+          <button data-v="1">Hold</button>
+          <button data-v="2">Toggle</button>
+        </div>
+        <div class="cap">Assign the gyro action to a control to hold or toggle
+          it. Always on will wander while you walk, since every step is a
+          rotation. Hold is the equivalent of lifting a mouse.</div>
+      </div>
+      <div class="set">
+        <div class="top"><span class="nm">Sensitivity</span><span class="vl" id="v-gsens">-</span></div>
+        <input type="range" id="s-gsens" min="1" max="200" step="1">
+        <div class="cap">Pixels per degree of rotation. A wrist sweep is around
+          40 degrees.</div>
+      </div>
+      <div class="set">
+        <div class="swrow"><span class="nm">Flip left and right</span>
+          <span class="sw"><input type="checkbox" id="t-ginvx"><span></span></span></div>
+      </div>
+      <div class="set">
+        <div class="swrow"><span class="nm">Flip up and down</span>
+          <span class="sw"><input type="checkbox" id="t-ginvy"><span></span></span></div>
+        <div class="cap">Sign conventions vary by how the controller is turned.
+          If it goes the wrong way, flip it here rather than re-gripping.</div>
+      </div>
+      <p class="note">
+        The resting reading is learned continuously, so the cursor does not
+        slide away on its own. That calibration keeps running even while the
+        gyro is gated off, so it is already settled the moment you enable it.
+      </p>
+      <div class="rowbtns">
+        <button id="save" class="warn" disabled>Save to dongle</button>
+        <button id="cal" disabled>Recentre sticks</button>
+        <button id="reset" disabled>Reset feel</button>
+      </div>
+     </div>
+    </div>
+   </section>
+
+   <!-- ==================== HARDWARE > TOUCHPAD ==================== -->
+   <section class="screen" data-screen="touchpad">
+    <div>
+     <p class="sect">Touchpad cursor</p>
+     <div class="panel">
+      <div class="set">
+        <div class="top"><span class="nm">Mode</span></div>
+        <div class="seg" id="seg-touch" style="margin-top:7px">
+          <button data-v="0">Off</button>
+          <button data-v="1">Trackpad</button>
+          <button data-v="2">Scroll only</button>
+        </div>
+        <div class="cap">Trackpad drags the cursor with one finger and scrolls
+          with two.</div>
+      </div>
+      <div class="set">
+        <div class="top"><span class="nm">Speed</span><span class="vl" id="v-tspeed">-</span></div>
+        <input type="range" id="s-tspeed" min="5" max="255" step="5">
+        <div class="cap">Pixels per 100 units of finger travel. The pad is 1920
+          units wide.</div>
+      </div>
+     </div>
+    </div>
+   </section>
+
+   <!-- ==================== HARDWARE > LEDS ==================== -->
+   <section class="screen" data-screen="leds">
+    <div class="soonbox">
+     <div class="t">The light bar is not controllable yet</div>
+     <div class="d">This one is genuinely ours to build. The dongle is the
+       Bluetooth host, so it can already set the light bar colour and the player
+       lights on the controller. Nothing on the Mac is involved.</div>
+     <div class="w">needs firmware</div>
+    </div>
+   </section>
+
+   <!-- ==================== HARDWARE > MICROPHONE ==================== -->
+   <section class="screen" data-screen="microphone">
+    <div class="soonbox">
+     <div class="t">The microphone cannot work here</div>
+     <div class="d">The controller's microphone is an audio device. In mouse-only
+       identity the dongle deliberately declares one pointer and nothing else, and
+       audio would mean carrying a whole sound device to every machine.</div>
+     <div class="w">not possible on the board</div>
+    </div>
+   </section>
+
+   <!-- ==================== ACTIVITY > STATS ==================== -->
+   <section class="screen" data-screen="stats">
+    <div class="soonbox">
+     <div class="t">Counts are not kept yet</div>
+     <div class="d">How far the cursor has travelled and which buttons you
+       actually use. Counters would live in flash on the board and would be read
+       back here, so this is buildable rather than blocked.</div>
+     <div class="w">needs firmware</div>
+    </div>
+   </section>
+
+   <!-- ==================== ACTIVITY > HISTORY ==================== -->
+   <section class="screen" data-screen="history">
+    <div class="soonbox">
+     <div class="t">Recent actions are not shown yet</div>
+     <div class="d">A running list of what fired and when. The input stream this
+       page already listens to carries enough to build it; nothing on the board
+       has to change.</div>
+     <div class="w">page work only</div>
+    </div>
+   </section>
+
+   <!-- ==================== SETTINGS (gear) ==================== -->
+   <section class="screen" data-screen="settings">
+    <div>
+     <p class="sect">What the machine sees</p>
+     <div class="panel">
+      <div class="set">
+        <div class="swrow">
+          <span class="nm">Declare a mouse and nothing else</span>
+          <span class="vl" id="v-pure">-</span>
+          <span class="sw"><input type="checkbox" id="t-pure" disabled><span></span></span>
+        </div>
+        <div class="cap" id="cap-pure">Off, the dongle also declares a keyboard and a
+          gamepad it never uses. macOS finds the unused keyboard, cannot identify it,
+          and opens Keyboard Setup Assistant asking for the key beside left Shift,
+          which does not exist. On, there is one pointer and this serial port.
+          Identity is fixed when the device is plugged in, so this reboots the dongle.</div>
+      </div>
+     </div>
+    </div>
+
+    <div>
+     <p class="sect">More than one controller</p>
+     <div class="panel">
+      <div class="set">
+        <div class="top"><span class="nm">When two are connected</span>
+          <span class="vl" id="v-router">-</span></div>
+        <div class="seg" id="seg-router" style="margin-top:7px">
+          <button data-v="0">Separate</button>
+          <button data-v="1">Act as one</button>
+        </div>
+        <div class="cap">Separate keeps each controller on its own player slot, so only
+          the first one drives the pointer. Act as one folds them together: buttons from
+          either count as pressed, and each stick axis takes whichever controller is
+          pushed furthest from centre. That is how a pair of Joy-Cons becomes a single
+          controller with two sticks — the left one holds the left stick, the right one
+          the right, and neither overwrites the other. Stored in flash and read when the
+          router starts, so this reboots the dongle.</div>
+      </div>
+      <p class="note" id="router-note">
+        Up to four controllers can be connected at once.
+      </p>
+     </div>
+    </div>
+
+    <div>
+     <p class="sect">Firmware</p>
+     <div class="panel" id="fwPanel">
+      <div class="fwnow">
+        <div><span class="k">on the board</span><span class="v" id="fw-rev">-</span></div>
+        <div><span class="k">mode</span><span class="v" id="fw-mode">-</span></div>
+        <div><span class="k">flash writes</span><span class="v" id="fw-writes">-</span></div>
+      </div>
+      <div class="fwsrc"><span id="fw-source">built-in list, not read from disk</span></div>
+      <div id="fwList" class="fwlist"></div>
+      <div class="steps">
+        <div class="step" id="st1">
+          <div class="sn">1</div>
+          <div class="sb">
+            <div class="st">Pick the file</div>
+            <div class="sc" id="sc1">Press Flash on a row above, or drag a .uf2 anywhere onto this panel.</div>
+          </div>
+          <button id="fwAdd">Add firmware</button>
+          <input type="file" id="fwFile" accept=".uf2" multiple hidden>
+        </div>
+        <div class="step" id="st2">
+          <div class="sn">2</div>
+          <div class="sb">
+            <div class="st">Put the board into flash mode</div>
+            <div class="sc" id="sc2">The dongle reboots into its bootloader and appears as a drive called RP2350. It stops being a mouse until a file lands on it.</div>
+          </div>
+          <button id="fwBoot" class="warn" disabled>Flash mode</button>
+        </div>
+        <div class="step" id="st3">
+          <div class="sn">3</div>
+          <div class="sb">
+            <div class="st">Point at RP2350 and write</div>
+            <div class="sc" id="sc3">Choose the RP2350 drive when asked. Dragging the file onto that drive in Finder does exactly the same thing.</div>
+          </div>
+          <button id="fwWrite" disabled>Write</button>
+        </div>
+      </div>
+      <p class="note" id="fw-state"></p>
+      <p class="note">
+        Flashing clears the Bluetooth bond. Re-pair afterwards by holding Create
+        and PS until the light bar flashes. Settings, bindings and presets live in
+        a separate part of flash and survive.
+      </p>
+     </div>
+    </div>
+   </section>
+
+  </div>
+ </main>
+</div>
+
+<script>
+const SYNC=0xAA, CMD=0x01;
+// Slot names change with the pad, the slots themselves never do. The firmware
+// maps face buttons by POSITION, so slot 0 is the bottom button on both pads —
+// Cross on a DualSense, B on a Joy-Con. A binding therefore survives a change of
+// controller; only the word for it moves.
+const NAMES_DS5=["Cross","Circle","Square","Triangle","L1","R1","L2","R2","Create",
+  "Options","L3","R3","D-Up","D-Down","D-Left","D-Right","PS","Touchpad"];
+const NAMES_JC=["B","A","Y","X","L","R","ZL","ZR","Minus",
+  "Plus","L3","R3","Up","Down","Left","Right","Home","Capture"];
+let SLOTS=NAMES_DS5;
+const FAM=["none","click","click","click","click","click","point","point",
+  "scroll","scroll","scroll","scroll","point"];
+// The glyph drawn on each control, so a card is identified by the thing you
+// press rather than by a word for it. Text only where a symbol would be a
+// guess: nobody reads a made-up icon for Create.
+const GLYPH_DS5=["✕","○","□","△","L1","R1","L2","R2","Create",
+  "Options","L3","R3","▲","▼","◀","▶","PS","Pad"];
+const GLYPH_JC=["B","A","Y","X","L","R","ZL","ZR","−",
+  "+","L3","R3","▲","▼","◀","▶","Home","Cap"];
+let GLYPH=GLYPH_DS5;
+const ROUND=new Set([0,1,2,3,10,11,16]);   // drawn as circles, as on the controller
+
+// Callouts are placed the way the controls sit in the hand, not listed. The
+// d-pad group is laid out as a d-pad; the middle column carries the touchpad
+// above the controller and the system buttons below it.
+const COL_L=[["Shoulder",[6,4]],["Left stick",[10],"stickL"],["D-pad",[12,14,15,13],"dpad"]];
+const COL_R=[["Shoulder",[7,5]],["Actions",[3,1,0,2]],["Right stick",[11],"stickR"]];
+let COL_MT=[["Touchpad",[17]]];
+const COL_MB=[["System",[8,9,16]]];
+
+// ---------------------------------------------------------------------------
+// The two pads
+// ---------------------------------------------------------------------------
+// One diagram, two drawings. Both use the same class vocabulary and the same
+// c-<slot> ids, so everything downstream — the lit state, the click-to-select,
+// the analogue trigger fill — works on either without knowing which is showing.
+// The DualSense artwork stays in the document rather than moving into a string
+// here: it is the drawing that was checked against the real controller, and
+// retyping it would put that at risk for no gain. It is lifted out at load.
+//
+// The Joy-Cons are drawn as the pair, upright, the way they sit in the rails.
+// A single one is what you would actually hold for gyro, but a pair shows every
+// control at once, and the firmware fills whichever half is connected.
+const JC_SVG=`
+  <defs>
+    <linearGradient id="gJC" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5a5a63"/><stop offset="1" stop-color="#2e2e34"/>
+    </linearGradient>
+  </defs>
+
+  <rect class="ctl trig" id="c-6" x="252" y="2" width="178" height="30" rx="13"/>
+  <text class="lbl" x="341" y="22">ZL</text>
+  <rect class="ctl trig" id="c-7" x="570" y="2" width="178" height="30" rx="13"/>
+  <text class="lbl" x="659" y="22">ZR</text>
+  <rect class="ctl bump" id="c-4" x="244" y="36" width="194" height="30" rx="13"/>
+  <text class="lbl dark" x="341" y="56">L</text>
+  <rect class="ctl bump" id="c-5" x="562" y="36" width="194" height="30" rx="13"/>
+  <text class="lbl dark" x="659" y="56">R</text>
+
+  <path class="body" style="fill:url(#gJC);stroke:#232328" d="M278 64 H434 Q446 64 446 76 V660 Q446 672 434 672 H278 Q232 672 232 626 V110 Q232 64 278 64 Z"/>
+  <path class="body" style="fill:url(#gJC);stroke:#232328" d="M566 64 H722 Q768 64 768 110 V626 Q768 672 722 672 H566 Q554 672 554 660 V76 Q554 64 566 64 Z"/>
+
+  <rect class="mute" style="fill:#1d1d21" x="434" y="76" width="12" height="584" rx="3"/>
+  <rect class="mute" style="fill:#1d1d21" x="554" y="76" width="12" height="584" rx="3"/>
+  <rect class="mute" style="fill:#43434a" x="433" y="250" width="14" height="56" rx="5"/>
+  <rect class="mute" style="fill:#43434a" x="433" y="386" width="14" height="56" rx="5"/>
+  <rect class="mute" style="fill:#43434a" x="553" y="250" width="14" height="56" rx="5"/>
+  <rect class="mute" style="fill:#43434a" x="553" y="386" width="14" height="56" rx="5"/>
+  <rect class="hole" x="436" y="470" width="8" height="16" rx="2"/>
+  <rect class="hole" x="436" y="496" width="8" height="16" rx="2"/>
+  <rect class="hole" x="436" y="522" width="8" height="16" rx="2"/>
+  <rect class="hole" x="436" y="548" width="8" height="16" rx="2"/>
+  <rect class="hole" x="556" y="470" width="8" height="16" rx="2"/>
+  <rect class="hole" x="556" y="496" width="8" height="16" rx="2"/>
+  <rect class="hole" x="556" y="522" width="8" height="16" rx="2"/>
+  <rect class="hole" x="556" y="548" width="8" height="16" rx="2"/>
+
+  <rect class="ctl small" id="c-8" x="396" y="98" width="26" height="18" rx="5"/>
+  <text class="tiny" x="409" y="92">minus</text>
+  <rect class="ctl small" id="c-9" x="700" y="98" width="26" height="18" rx="5"/>
+  <text class="tiny" x="713" y="92">plus</text>
+
+  <circle class="well" cx="341" cy="200" r="62"/>
+  <circle class="ctl stick" id="c-10" cx="341" cy="200" r="46"/>
+  <circle class="cap" id="dot-L" cx="341" cy="200" r="19"/>
+  <text class="tiny" id="lbl-L" x="341" y="282">pointer</text>
+
+  <circle class="ctl face" id="c-12" cx="341" cy="362" r="27"/>
+  <text class="glyph small" x="341" y="367">&#9650;</text>
+  <circle class="ctl face" id="c-13" cx="341" cy="486" r="27"/>
+  <text class="glyph small" x="341" y="491">&#9660;</text>
+  <circle class="ctl face" id="c-14" cx="279" cy="424" r="27"/>
+  <text class="glyph small" x="279" y="429">&#9664;</text>
+  <circle class="ctl face" id="c-15" cx="403" cy="424" r="27"/>
+  <text class="glyph small" x="403" y="429">&#9654;</text>
+
+  <rect class="ctl small" id="c-17" x="324" y="556" width="34" height="34" rx="8"/>
+  <circle class="hole" cx="341" cy="573" r="7"/>
+  <text class="tiny" x="341" y="612">capture</text>
+
+  <circle class="ctl face" id="c-3" cx="661" cy="146" r="29"/>
+  <text class="glyph" x="661" y="155">X</text>
+  <circle class="ctl face" id="c-1" cx="721" cy="206" r="29"/>
+  <text class="glyph" x="721" y="215">A</text>
+  <circle class="ctl face" id="c-0" cx="661" cy="266" r="29"/>
+  <text class="glyph" x="661" y="275">B</text>
+  <circle class="ctl face" id="c-2" cx="601" cy="206" r="29"/>
+  <text class="glyph" x="601" y="215">Y</text>
+
+  <circle class="well" cx="661" cy="424" r="62"/>
+  <circle class="ctl stick" id="c-11" cx="661" cy="424" r="46"/>
+  <circle class="cap" id="dot-R" cx="661" cy="424" r="19"/>
+  <text class="tiny" id="lbl-R" x="661" y="506">pointer</text>
+
+  <circle class="ctl ps" id="c-16" cx="661" cy="572" r="24"/>
+  <path class="hole" d="M661 561 l11 10 h-4 v9 h-14 v-9 h-4 z"/>
+  <text class="tiny" x="661" y="612">home</text>
+
+  <g id="battwrap" style="display:none">
+    <rect class="battbox" id="battbox" x="474" y="360" width="52" height="22" rx="6"/>
+    <text class="battxt" id="batt-t" x="500" y="375">--</text>
+  </g>`;
+
+const PADS={
+  ds5:{box:"-30 -14 1060 700", aria:"DualSense controller, lit as you press",
+       names:NAMES_DS5, glyphs:GLYPH_DS5, mid:"Touchpad",
+       sticks:{L:[385,313.5], R:[615,313.5], travel:30}, svg:null},
+  jc:{box:"-30 -14 1060 700", aria:"Joy-Con pair, lit as you press",
+      names:NAMES_JC, glyphs:GLYPH_JC, mid:"Capture",
+      sticks:{L:[341,200], R:[661,424], travel:26}, svg:JC_SVG}
+};
+let padKey="ds5";
+
+function setPad(k){
+  const v=PADS[k]; if(!v||!v.svg) return;
+  padKey=k; SLOTS=v.names; GLYPH=v.glyphs; COL_MT=[[v.mid,[17]]];
+  const svg=$("pad");
+  svg.setAttribute("viewBox",v.box);
+  svg.setAttribute("aria-label",v.aria);
+  svg.innerHTML=v.svg;
+  buildCallouts();
+  paint();
+  for(const b of $("seg-pad").children) b.classList.toggle("on",b.dataset.v===k);
+  try{ localStorage.setItem("padKey",k); }catch(e){}
+}
+
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+// Every screen the app this follows has, in its order, including the ones that
+// cannot exist on a microcontroller. A tab that is missing says nothing; a tab
+// that is dimmed says what is coming and what never will.
+const GROUPS=[
+  ["Map",      [["buttons","Buttons",1],["chords","Chords",0],
+                ["sequences","Sequences",0],["gestures","Gestures",0]]],
+  ["Automate", [["macros","Macros",0],["scripts","Scripts",0],
+                ["wheel","Wheel",0],["keyboard","Keyboard",0]]],
+  ["Hardware", [["input","Input",0],["joysticks","Joysticks",1],
+                ["touchpad","Touchpad",1],["leds","LEDs",0],
+                ["microphone","Microphone",0]]],
+  ["Activity", [["stats","Stats",0],["history","History",0]]],
+];
+let curGroup=0, curScreen="buttons";
+
+function buildTabs(){
+  const t=$("tabs"); t.innerHTML="";
+  GROUPS.forEach(([name,subs],gi)=>{
+    const b=document.createElement("button");
+    b.className="tab"+(gi===curGroup?" on":"");
+    b.innerHTML='<span>'+name+'</span><span class="ct">'+subs.length+'</span>';
+    b.onclick=()=>{curGroup=gi;
+      // Land on the first screen of the group that is actually built, so a
+      // group whose first tab is unbuilt does not open on a dead end.
+      const live=subs.find(s=>s[2])||subs[0];
+      showScreen(live[0]);};
+    t.appendChild(b);
+  });
+}
+function buildSubtabs(){
+  const s=$("subtabs"); s.innerHTML="";
+  if(curScreen==="settings"){
+    const b=document.createElement("button");
+    b.className="subtab on"; b.textContent="Identity and firmware";
+    s.appendChild(b); return;
+  }
+  for(const [id,label,built] of GROUPS[curGroup][1]){
+    const b=document.createElement("button");
+    b.className="subtab"+(built?"":" soon")+(id===curScreen?" on":"");
+    b.textContent=label;
+    b.onclick=()=>showScreen(id);
+    s.appendChild(b);
+  }
+}
+function showScreen(id){
+  curScreen=id;
+  if(id!=="settings"){
+    const gi=GROUPS.findIndex(g=>g[1].some(s=>s[0]===id));
+    if(gi>=0) curGroup=gi;
+  }
+  for(const el of document.querySelectorAll(".screen"))
+    el.classList.toggle("on",el.dataset.screen===id);
+  $("gear").classList.toggle("on",id==="settings");
+  buildTabs(); buildSubtabs();
+  try{localStorage.setItem("pb.screen",id);}catch(e){}
+}
+
+function crc16(d){let c=0xFFFF;for(const b of d){c^=b<<8;
+  for(let i=0;i<8;i++)c=(c&0x8000)?((c<<1)^0x1021)&0xFFFF:(c<<1)&0xFFFF;}return c;}
+function frame(seq,obj){
+  const p=new TextEncoder().encode(JSON.stringify(obj));
+  const h=new Uint8Array(5);h[0]=SYNC;h[1]=p.length&0xFF;h[2]=p.length>>8;h[3]=CMD;h[4]=seq;
+  const cd=new Uint8Array(2+p.length);cd[0]=CMD;cd[1]=seq;cd.set(p,2);
+  const c=crc16(cd),out=new Uint8Array(5+p.length+2);
+  out.set(h,0);out.set(p,5);out[5+p.length]=c&0xFF;out[6+p.length]=c>>8;return out;}
+
+let port=null,writer=null,seq=0,rx=new Uint8Array(0),pending=null,samples=0;
+let map=[1,2,3,5,4,3,2,1,0,0,6,7,0,0,0,0,0,1];
+let actionNames=["none","left","right","middle","back","forward","precision",
+  "turbo","scroll up","scroll down","scroll left","scroll right","recentre"];
+let modes={stick_mode:0,touch_mode:1,dial_source:0,gyro_mode:0,gyro_orient:1,gyro_gate:1};
+let picked=null;          // slot whose card is selected
+let prevButtons=0;        // for edge detection on the live stream
+function $(id){return document.getElementById(id);}
+const status=(t,c)=>{const s=$("status");s.textContent=t;s.className=c||"";};
+function cat(a,b){const o=new Uint8Array(a.length+b.length);o.set(a,0);o.set(b,a.length);return o;}
+
+function digest(){
+  while(rx.length>=7){
+    let i=rx.indexOf(SYNC); if(i<0){rx=new Uint8Array(0);return;}
+    if(i>0) rx=rx.slice(i);
+    if(rx.length<7) return;
+    const len=rx[1]|(rx[2]<<8), total=5+len+2;
+    if(rx.length<total) return;
+    const type=rx[3],sq=rx[4],pay=rx.slice(5,5+len);
+    const got=rx[5+len]|(rx[6+len]<<8);
+    const cd=new Uint8Array(2+len);cd[0]=type;cd[1]=sq;cd.set(pay,2);
+    rx=rx.slice(total);
+    if(crc16(cd)!==got) continue;
+    let o; try{o=JSON.parse(new TextDecoder().decode(pay));}catch(e){continue;}
+    if(Array.isArray(o)) live(o); else if(pending){pending(o);pending=null;}
+  }
+}
+async function readLoop(){
+  const r=port.readable.getReader();
+  try{for(;;){const{value,done}=await r.read();if(done)break;
+    if(value){rx=cat(rx,value);digest();}}}
+  catch(e){status("link lost","err");serialOpen=false;setDev(false);fwStep();}finally{r.releaseLock();}
+}
+function send(cmd,args){
+  return new Promise(res=>{pending=res;
+    writer.write(frame(seq,Object.assign({cmd},args||{})));seq=(seq+1)&0xFF;
+    setTimeout(()=>{if(pending){pending=null;res(null);}},900);});
+}
+
+// Blend two hex colours, for the analogue trigger travel.
+function mix(a,b,t){
+  const h=c=>[1,3,5].map(i=>parseInt(c.substr(i,2),16));
+  const [r1,g1,b1]=h(a),[r2,g2,b2]=h(b);
+  const p=n=>Math.round(n).toString(16).padStart(2,"0");
+  return "#"+p(r1+(r2-r1)*t)+p(g1+(g2-g1)*t)+p(b1+(b2-b1)*t);
+}
+
+function setDev(on,name){
+  const p=$("devpill"); p.classList.toggle("live",!!on);
+  $("devname").textContent=on?(name||"DualSense Wireless Controller"):"no controller";
+}
+
+/* Output packets are ["o",player,buttons,hex]; input packets carry an extra
+   address field, so buttons sit one slot later. Reading one layout for both
+   silently mistakes an address for a button mask. */
+function live(a){
+  let buttons,hex;
+  if(a[0]==="o"){buttons=a[2];hex=a[3];}
+  else if(a[0]==="i"){buttons=a[3];hex=a[4];}
+  else return;
+  if(typeof hex!=="string"||hex.length<8) return;
+  const ax=[];for(let i=0;i<7;i++)ax.push(parseInt(hex.substr(i*2,2),16));
+  samples++; $("r-n").textContent=samples;
+  if(samples===1) setDev(true);
+  const sw=modes.stick_mode===1;
+  const px=sw?ax[0]:ax[2], py=sw?ax[1]:ax[3], sx=sw?ax[2]:ax[0], sy=sw?ax[3]:ax[1];
+  $("r-rs").textContent=(ax[2]-128)+", "+(ax[3]-128);
+  $("r-ls").textContent=(ax[0]-128)+", "+(ax[1]-128);
+  // Stick centres and travel come from whichever pad is drawn — the Joy-Con
+  // sticks are nowhere near where the DualSense keeps its own.
+  const st=PADS[padKey].sticks, tv=st.travel;
+  $("dot-R").setAttribute("cx",st.R[0]+(px-128)/128*tv);
+  $("dot-R").setAttribute("cy",st.R[1]+(py-128)/128*tv);
+  $("dot-L").setAttribute("cx",st.L[0]+(sx-128)/128*tv);
+  $("dot-L").setAttribute("cy",st.L[1]+(sy-128)/128*tv);
+  const on=[];
+  for(let s=0;s<18;s++){
+    const hit=(buttons>>>s)&1; if(hit) on.push(SLOTS[s]);
+    const el=$("c-"+s); if(el) el.classList.toggle("lit",!!hit);
+    const chip=$("chip-"+s); if(chip) chip.classList.toggle("lit",!!hit);
+    // The card reacts too, not just the glyph, so the thing you are reading
+    // is the thing that flashes.
+    const row=$("bind-"+s); if(row) row.classList.toggle("down",!!hit);
+  }
+  $("r-btn").textContent=on.length?on.join(", "):"none";
+
+  // L2 and R2 are analogue. axes[4] and axes[5] carry how far each is squeezed,
+  // so the shoulder shows the travel rather than a plain on or off.
+  for(const [slot,ax_i] of [[6,4],[7,5]]){
+    const el=$("c-"+slot); if(!el) continue;
+    const v=ax[ax_i]/255;
+    el.style.fill=v>0.02?mix("#c3c3c8","#0a84ff",v):"";
+    const row=$("bind-"+slot);
+    if(row&&!((buttons>>>slot)&1)) row.classList.toggle("down",v>0.5);
+  }
+  $("r-trig").textContent=Math.round(ax[4]/2.55)+", "+Math.round(ax[5]/2.55);
+
+  // Press a button on the controller and its card is the one you are editing.
+  // Only on the leading edge, or holding a button would fight the cursor.
+  const fresh=buttons&~prevButtons;
+  prevButtons=buttons;
+  const strip=$("strip-now");
+  if(on.length){strip.textContent=on.join("  +  ");strip.classList.add("hit");}
+  else{strip.textContent="Waiting for input";strip.classList.remove("hit");}
+  if(fresh&&$("t-pick").checked&&curScreen==="buttons"){
+    for(let s=0;s<18;s++) if((fresh>>>s)&1){ pick(s); break; }
+  }
+}
+
+function pick(slot){
+  picked=slot;
+  for(const el of document.querySelectorAll(".bind"))
+    el.classList.toggle("sel",+el.dataset.slot===slot);
+  for(let s=0;s<18;s++){
+    const el=$("c-"+s); if(el) el.classList.toggle("pick",s===slot);
+  }
+  const row=$("bind-"+slot);
+  if(row) row.scrollIntoView({block:"nearest",behavior:"smooth"});
+}
+
+/* The diagram must not claim a control does something it no longer does: a
+   trigger turned into the speed dial and the mode key are shown as themselves,
+   not as whatever binding they still hold underneath. */
+function famOf(slot){
+  if(slot===9) return "chord";
+  if(modes.dial_source===1&&slot===6) return "dial";
+  if(modes.dial_source===2&&slot===7) return "dial";
+  return FAM[map[slot]]||"none";
+}
+
+// A card carries what the control does, written out. Changing it is a menu on
+// the card, not a dropdown parked in the row, so the screen reads as a summary
+// of the controller rather than as a form.
+function bindRow(s){
+  const row=document.createElement("div");
+  row.className="bind"; row.id="bind-"+s; row.dataset.slot=s;
+
+  const gl=document.createElement("div");
+  gl.className="glyph"+(ROUND.has(s)?" round":""); gl.id="chip-"+s;
+  gl.textContent=GLYPH[s]; gl.title=SLOTS[s];
+  gl.onclick=()=>pick(s);
+
+  // One card per control. Today it holds a single row; press, double and hold
+  // stack inside the same card once the board can store them.
+  const card=document.createElement("div"); card.className="bcard";
+  const brow=document.createElement("button");
+  brow.className="brow"; brow.id="sel-"+s;
+  const badge=document.createElement("span");
+  badge.className="badge press"; badge.textContent="▾";
+  const val=document.createElement("span"); val.className="val";
+  brow.appendChild(badge); brow.appendChild(val);
+  brow.onclick=e=>{pick(s);openPicker(s,brow);e.stopPropagation();};
+  card.appendChild(brow);
+
+  row.appendChild(gl); row.appendChild(card);
+  return row;
+}
+
+function buildCallouts(){
+  const render=(host,groups)=>{
+    host.innerHTML="";
+    for(const [title,slots,shape] of groups){
+      const g=document.createElement("div"); g.className="grp";
+      const h=document.createElement("p"); h.className="gh";
+      const t=document.createElement("span"); t.textContent=title; h.appendChild(t);
+      // The stick groups carry their role on the header line, as theirs do.
+      if(shape==="stickL"||shape==="stickR"){
+        const sp=document.createElement("span"); sp.className="spacer"; h.appendChild(sp);
+        const r=document.createElement("span");
+        r.className="pick"; r.id="role-"+(shape==="stickL"?"L":"R");
+        h.appendChild(r);
+      }
+      g.appendChild(h);
+
+      if(shape==="dpad"){
+        // Laid out as a d-pad: up above, left and right beside, down below.
+        const box=document.createElement("div");
+        box.style.cssText="display:grid;grid-template-columns:1fr 1fr;gap:0 10px";
+        const up=bindRow(slots[0]);   up.style.gridColumn="1 / -1";
+        const lf=bindRow(slots[1]);
+        const rt=bindRow(slots[2]);
+        const dn=bindRow(slots[3]);   dn.style.gridColumn="1 / -1";
+        box.appendChild(up); box.appendChild(lf); box.appendChild(rt); box.appendChild(dn);
+        g.appendChild(box);
+      }else{
+        for(const s of slots) g.appendChild(bindRow(s));
+      }
+      host.appendChild(g);
+    }
+  };
+  render($("colL"),COL_L);
+  render($("colR"),COL_R);
+  render($("colMTop"),COL_MT);
+  render($("colMBot"),COL_MB);
+  // The controller is the other way into the same cards.
+  for(let s=0;s<18;s++){
+    const el=$("c-"+s); if(el) el.onclick=()=>pick(s);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Action picker
+// ---------------------------------------------------------------------------
+let popEl=null;
+function closePicker(){ if(popEl){popEl.remove();popEl=null;} }
+document.addEventListener("click",closePicker);
+document.addEventListener("keydown",e=>{ if(e.key==="Escape") closePicker(); });
+
+function openPicker(slot,anchor){
+  closePicker();
+  if(famOf(slot)==="dial"||famOf(slot)==="chord") return;
+  const p=document.createElement("div"); p.className="pop";
+  actionNames.forEach((n,i)=>{
+    const b=document.createElement("button");
+    b.textContent=n; if(i===map[slot]) b.className="on";
+    b.onclick=async ev=>{
+      ev.stopPropagation(); closePicker();
+      const r=await send("MAP.SET",{slot,action:i});
+      if(r&&r.map){map=r.map;paint();status("set "+SLOTS[slot],"on");}
+      else{ map[slot]=i; paint(); }   // no board attached; still show the choice
+    };
+    p.appendChild(b);
+  });
+  document.body.appendChild(p);
+  const r=anchor.getBoundingClientRect();
+  const top=Math.min(r.bottom+scrollY+5, scrollY+innerHeight-p.offsetHeight-10);
+  const left=Math.min(r.left+scrollX, scrollX+innerWidth-p.offsetWidth-10);
+  p.style.top=Math.max(scrollY+8,top)+"px";
+  p.style.left=Math.max(8,left)+"px";
+  p.onclick=e=>e.stopPropagation();
+  popEl=p;
+}
+
+function paint(){
+  for(let s=0;s<18;s++){
+    const fam=famOf(s);
+    // The shape classes on the artwork are structural, so selection is a class
+    // toggle rather than a rewrite. Rewriting it erased the controller.
+    const el=$("c-"+s);
+    if(el) el.classList.toggle("pick",s===picked);
+    const brow=$("sel-"+s);
+    if(brow){
+      // A dialing trigger and the mode key are not free to hold a binding, and
+      // the card says so rather than showing a binding that never fires.
+      const taken=(fam==="dial"||fam==="chord");
+      const badge=brow.querySelector(".badge");
+      const val=brow.querySelector(".val");
+      badge.textContent=taken?(fam==="dial"?"◐":"⌘"):"▾";
+      badge.className="badge "+(taken?"g":"press");
+      const name=taken
+        ? (fam==="dial"?"Speed dial":"Mode key")
+        : (actionNames[map[s]]||"none");
+      val.textContent=name.charAt(0).toUpperCase()+name.slice(1);
+      val.className="val"+((!taken&&!map[s])?" off":"");
+      brow.disabled=taken;
+      brow.title=taken?(fam==="dial"?"used as the speed dial":"held to change modes"):"";
+      brow.style.cursor=taken?"default":"pointer";
+    }
+  }
+  const roleL=modes.stick_mode===1?"pointer":(modes.stick_mode===2?"fine":"scroll");
+  const roleR=modes.stick_mode===1?"scroll":(modes.stick_mode===2?"coarse":"pointer");
+  $("lbl-L").textContent=roleL;
+  $("lbl-R").textContent=roleR;
+  const rl=$("role-L"), rr=$("role-R");
+  if(rl) rl.textContent=roleL.charAt(0).toUpperCase()+roleL.slice(1);
+  if(rr) rr.textContent=roleR.charAt(0).toUpperCase()+roleR.slice(1);
+  for(const[k,id]of[["stick_mode","seg-stick"],["touch_mode","seg-touch"],["dial_source","seg-dial"],
+   ["gyro_mode","seg-gyro"],["gyro_orient","seg-orient"],["gyro_gate","seg-gate"]]){
+    for(const b of $(id).children) b.classList.toggle("on",+b.dataset.v===modes[k]);
+  }
+  const dual=modes.stick_mode===2;
+  $("row-fine").style.opacity=dual?"1":".4"; $("s-fine").disabled=!dual;
+  const dialOn=modes.dial_source!==0;
+  $("s-dial").disabled=!dialOn;
+  // Grip only means anything in fixed-grip mode.
+  const fixed=modes.gyro_mode===1;
+  $("row-orient").style.opacity=fixed?"1":".4";
+  for(const b of $("seg-orient").children) b.disabled=!fixed;
+  $("s-gsens").disabled=modes.gyro_mode===0;
+  countBindings();
+}
+
+// The rail says how much is in each profile, the way the app this follows does.
+// Only the live one can be counted without loading every slot, and loading a
+// slot to count it would change what the board is doing.
+function countBindings(){
+  const n=map.filter(a=>a&&a!==0).length;
+  const el=$("live-count"); if(el) el.textContent=n+(n===1?" binding":" bindings");
+}
+
+const FIELDS=[["speed","s-speed","v-speed",""],["scroll_v","s-sv","v-sv",""],
+  ["scroll_h","s-sh","v-sh",""],["curve","s-curve","v-curve",""],
+  ["scroll_curve","s-scurve","v-scurve",""],["precision","s-prec","v-prec","%"],
+  ["turbo","s-turbo","v-turbo","%"],["fine","s-fine","v-fine","%"],
+  ["touch_speed","s-tspeed","v-tspeed",""],["dial_pct","s-dial","v-dial","%"],
+  ["gyro_sens","s-gsens","v-gsens",""]];
+const UNITS={speed:" px/s",scroll_v:" clicks/s",scroll_h:" clicks/s",
+  touch_speed:" px/100",gyro_sens:" px/deg"};
+const FLAGS=[["invert_v","t-invv"],["invert_h","t-invh"],
+  ["gyro_invert_x","t-ginvx"],["gyro_invert_y","t-ginvy"]];
+
+function show(c){
+  if(!c) return;
+  for(const[k,s,v,suf]of FIELDS){
+    if(c[k]==null) continue;
+    $(s).value=c[k]; $(v).textContent=c[k]+(UNITS[k]||suf);
+  }
+  for(const[k,t]of FLAGS) if(c[k]!=null) $(t).checked=!!c[k];
+  for(const k of["stick_mode","touch_mode","dial_source","gyro_mode","gyro_orient","gyro_gate"])
+    if(c[k]!=null) modes[k]=c[k];
+  paint();
+}
+async function push(){
+  const a=Object.assign({},modes);
+  for(const[k,s]of FIELDS)a[k]=+$(s).value;
+  for(const[k,t]of FLAGS)a[k]=$(t).checked?1:0;
+  const r=await send("MOUSE.SET",a);
+  // Turning the dial on moves a click to the bumper, so the map changed too.
+  const m=await send("MAP.GET"); if(m&&m.map)map=m.map;
+  show(r);
+}
+for(const[k,s,v,suf]of FIELDS){
+  $(s).addEventListener("input",()=>{$(v).textContent=$(s).value+(UNITS[k]||suf);});
+  $(s).addEventListener("change",push);
+}
+for(const[,t]of FLAGS) $(t).addEventListener("change",push);
+for(const[k,id]of[["stick_mode","seg-stick"],["touch_mode","seg-touch"],["dial_source","seg-dial"],
+   ["gyro_mode","seg-gyro"],["gyro_orient","seg-orient"],["gyro_gate","seg-gate"]])
+  for(const b of $(id).children) b.addEventListener("click",()=>{modes[k]=+b.dataset.v;push();});
+
+async function refreshPresets(){
+  const r=await send("PRESET.LIST"); if(!r||!r.presets) return;
+  const box=$("presetList"); box.innerHTML="";
+  for(const p of r.presets){
+    const c=document.createElement("div");
+    c.className="pcard"+(p.slot===0?" live":"")+(p.used?"":" empty");
+    const nm=document.createElement("div"); nm.className="nm";
+    const nmt=document.createElement("span");
+    nmt.textContent=p.used?p.name:(p.slot===0?"unsaved":"empty slot "+p.slot);
+    nm.appendChild(nmt);
+    const meta=document.createElement("div"); meta.className="meta";
+    if(p.slot===0){ meta.id="live-count"; meta.textContent="counting"; }
+    else meta.textContent="slot "+p.slot;
+    c.appendChild(nm); c.appendChild(meta);
+    const acts=document.createElement("div"); acts.className="acts";
+    if(p.used){
+      const l=document.createElement("button"); l.textContent="Load";
+      l.onclick=async(e)=>{e.stopPropagation();
+        const cfg=await send("PRESET.LOAD",{slot:p.slot});
+        const m=await send("MAP.GET"); if(m&&m.map)map=m.map;
+        if(cfg&&cfg.speed!=null){show(cfg);status("loaded "+p.name,"on");}};
+      acts.appendChild(l);
+    }
+    const s=document.createElement("button");
+    s.textContent=p.slot===0?"Set live":"Save here";
+    s.onclick=async(e)=>{e.stopPropagation();
+      const n=$("presetName").value.trim()||(p.used?p.name:"preset "+p.slot);
+      const r2=await send("PRESET.SAVE",{slot:p.slot,name:n});
+      status(r2&&r2.ok?"saved":"save failed",r2&&r2.ok?"on":"err");refreshPresets();};
+    acts.appendChild(s);
+    if(p.used&&p.slot!==0){
+      const d=document.createElement("button"); d.textContent="Delete";
+      d.onclick=async(e)=>{e.stopPropagation();
+        await send("PRESET.DELETE",{slot:p.slot});refreshPresets();};
+      acts.appendChild(d);
+    }
+    c.appendChild(acts); box.appendChild(c);
+  }
+  countBindings();
+}
+$("presetSave").onclick=async()=>{
+  const r=await send("PRESET.LIST"); if(!r||!r.presets) return;
+  const free=r.presets.find(p=>p.slot>0&&!p.used);
+  if(!free){status("all seven slots are full","err");return;}
+  const n=$("presetName").value.trim()||"preset "+free.slot;
+  const r2=await send("PRESET.SAVE",{slot:free.slot,name:n});
+  status(r2&&r2.ok?"saved "+n:"save failed",r2&&r2.ok?"on":"err");
+  $("presetName").value=""; refreshPresets();
+};
+
+$("gear").onclick=()=>showScreen(curScreen==="settings"?"buttons":"settings");
+
+$("connect").onclick=async()=>{
+  try{
+    port=await navigator.serial.requestPort();
+    await port.open({baudRate:115200});
+    writer=port.writable.getWriter(); readLoop();
+    status("connected","on"); $("connect").disabled=true;
+    for(const b of["save","cal","reset","mapReset","presetSave"]) $(b).disabled=false;
+    const m=await send("MAP.GET");
+    if(m&&m.map){map=m.map;actionNames=m.names;buildCallouts();}
+    show(await send("MOUSE.GET"));
+    await showPure();
+    await showRouter();
+    await showFirmware();
+    await refreshPresets();
+    await showBattery();
+    setInterval(showBattery,60000);
+    await send("INPUT.STREAM",{enable:true});
+  }catch(e){status(e.message||"could not connect","err");}
+};
+// The controller's charge, shown where theirs shows it. Only meaningful once a
+// controller is actually bonded, so a missing reading is left blank.
+// The charge that matters is the controller's, not the board's. It rides along
+// in BT.STATUS per connected device (batt/charging; 0 = the pad never said) —
+// BATT.GET is not compiled for this board and read the board's rail anyway.
+// With two pads connected (a Joy-Con pair), the strip names each side and the
+// badge on the diagram shows the lower of the two, since that one dies first.
+async function showBattery(){
+  const r=await send("BT.STATUS"); if(!r||!r.devices) return;
+  const pads=r.devices.filter(d=>d.connected&&d.batt>0);
+  let pct=null, charging=false, txt="";
+  if(pads.length){
+    const low=pads.reduce((a,b)=>b.batt<a.batt?b:a);
+    pct=low.batt; charging=pads.some(d=>d.charging);
+    if(pads.length>1){
+      txt=pads.map(d=>{
+        const m=/\((L|R)\)/.exec(d.name||"");
+        return (m?m[1]+" ":"")+d.batt+"%"+(d.charging?" ⚡":"");
+      }).join(" · ");
+    }else txt=pct+"%"+(charging?" ⚡":"");
+  }
+  $("strip-batt").textContent=txt;
+  const w=$("battwrap");
+  if(w){
+    w.style.display=(pct==null)?"none":"";
+    if(pct!=null) $("batt-t").textContent=pct+"%";
+    const box=$("battbox");
+    if(box) box.setAttribute("fill",charging?"#0a84ff":(pct<=20?"#ff453a":"#30d158"));
+  }
+}
+// Identity is not part of a preset and does not travel through MOUSE.SET. It is
+// declared at enumeration, so it needs its own command and a reboot. "stored"
+// is what the next boot will use, "active" is what the host was actually told.
+async function showPure(){
+  const r=await send("MOUSE.PURE"); if(!r) return;
+  $("t-pure").checked=!!r.stored;
+  $("t-pure").disabled=false;
+  $("v-pure").textContent=r.active?"mouse only":"mouse, keyboard, gamepad";
+  $("cap-pure").style.opacity=(r.stored!==r.active)?".55":"1";
+  if(r.stored!==r.active)
+    status("identity changes on the next plug-in","err");
+}
+// Two controllers as one. ROUTER.SET writes routing_mode and merge_mode to
+// flash; the router only reads them at startup, so it answers reboot:true and
+// nothing changes until the board comes back.
+//   routing_mode 0 = SIMPLE (one player each), 1 = MERGE (all into one)
+//   merge_mode   1 = BLEND  (OR the buttons, take each axis furthest from centre)
+// Values from core/router/router.h.
+async function showRouter(){
+  const r=await send("ROUTER.GET"); if(!r) return;
+  const merged=(r.routing_mode===1&&r.merge_mode===1);
+  $("v-router").textContent=merged?"act as one":"separate";
+  for(const b of $("seg-router").children)
+    b.classList.toggle("on",(+b.dataset.v===1)===merged);
+  for(const b of $("seg-router").children) b.disabled=false;
+}
+for(const b of $("seg-router").children) b.addEventListener("click",async()=>{
+  const one=+b.dataset.v===1;
+  for(const x of $("seg-router").children) x.disabled=true;
+  const r=await send("ROUTER.SET",
+    one?{routing_mode:1,merge_mode:1}:{routing_mode:0,merge_mode:0});
+  if(r&&r.ok){
+    $("router-note").textContent=
+      "Saved. It takes effect when the dongle restarts — unplug and plug it back in.";
+    status("restart the dongle to apply","err");
+  }else status("could not save that","err");
+  await showRouter();
+});
+
+$("t-pure").addEventListener("change",async()=>{
+  const on=$("t-pure").checked;
+  $("t-pure").disabled=true;
+  status(on?"switching to mouse only, dongle is rebooting"
+           :"switching back, dongle is rebooting","on");
+  // The port goes away with the reboot, so this reply may never arrive.
+  send("MOUSE.PURE",{on:on?1:0});
+});
+// ---------------------------------------------------------------------------
+// Firmware
+// ---------------------------------------------------------------------------
+// Chrome will not let a page opened straight from a file read anything beside
+// it - not a neighbouring file, not a directory listing, not by fetch and not
+// by XHR. All three were tried; all three are refused. So the contents of
+// the list of known builds is written into this page instead of discovered by
+// it, so the panel can name a build and say what changed in it with nothing to
+// choose and nothing to search for.
+//
+// The listing is the part that can be known without permission. The bytes are
+// not: writing one to the board still needs the file handed over once, either
+// by dropping it on this page or by dragging it onto the RP2350 drive in the
+// file manager, which works just as well and needs nothing from here.
+
+/* FWLIST-BEGIN */
+// The published build. Download the .uf2 from the GitHub release, then drop it
+// on this page or drag it onto the RP2350 drive.
+const FW_INDEX=[
+ {"file": "joypad-puremouse-v20.uf2", "where": "release", "size": 1562624, "when": "01 Aug 2026", "ds": "Fixes pairing a second controller while one is connected. A Joy-Con connects over the direct channel path, which never fired the event that clears the connection-in-progress flag, so every later button press was silently refused. Carries the second-controller discovery fix, the easier triple-click, and controller battery in BT.STATUS.", "tag": "current"}
+];
+/* FWLIST-END */
+
+const FW_BY_FILE=Object.fromEntries(FW_INDEX.map(b=>[b.file,b]));
+
+// Revision string as INFO reports it, derived from the filename, so a row can
+// be matched against the board without keeping a second list in step.
+function revOfFile(name){
+  const m=/^joypad-(puremouse-v\d+)\.uf2$/i.exec(name);
+  return m?m[1]:null;
+}
+function sortKey(name){
+  const m=/v(\d+)/i.exec(name);
+  return m?parseInt(m[1],10):-1;
+}
+
+let fwDrive=null;         // RP2350 bootloader volume, once chosen
+let fwRev=null;           // what the board says it is running
+const fwDropped={};       // filename -> File, for anything dropped this visit
+
+function fwState(t){ $("fw-state").textContent=t||""; }
+
+function paintFw(rev){
+  fwRev=rev!==undefined?rev:fwRev;
+
+  // Every file the generator found, plus anything dropped on the page this
+  // session. Dropped files carry their bytes, so they can be written; the
+  // generated ones carry only a name until the bytes are handed over.
+  const rows=FW_INDEX.map(b=>({
+      name:b.file, where:b.where, size:b.size, when:b.when,
+      ds:b.ds, tag:b.tag||"", file:fwDropped[b.file]||null}));
+  for(const name of Object.keys(fwDropped)){
+    if(!FW_BY_FILE[name])
+      rows.unshift({name, where:"dropped", size:fwDropped[name].size, when:"just now",
+                    ds:"Dropped on this page. It is not in the firmware folder unless you put it there.",
+                    tag:"dropped", file:fwDropped[name]});
+  }
+
+  $("fw-source").textContent = FW_INDEX.length
+    ? FW_INDEX.length+" published build"+(FW_INDEX.length===1?"":"s")
+    : "no builds listed";
+
+  const box=$("fwList"); box.innerHTML="";
+  for(const r of rows){
+    const row=document.createElement("div");
+    const here=fwRev&&revOfFile(r.name)===fwRev;
+    row.className="fwrow"+(here?" here":"");
+
+    const left=document.createElement("div"); left.className="nmwrap";
+    const nm=document.createElement("div"); nm.className="nm"; nm.textContent=r.name;
+    const meta=document.createElement("div"); meta.className="mt";
+    meta.textContent=[r.where, r.size?Math.round(r.size/1024)+" KB":"", r.when]
+      .filter(Boolean).join("  ·  ");
+    left.appendChild(nm); left.appendChild(meta);
+
+    const ds=document.createElement("div"); ds.className="ds"; ds.textContent=r.ds;
+    const tag=document.createElement("div"); tag.className="tag";
+    tag.textContent=here?"on the board":r.tag;
+    const go=document.createElement("button");
+    go.textContent=r.file?"Flash":"Flash…";
+    go.title=r.file?"Write this file to the board":
+      "The page does not have this file's contents yet; it will ask for it";
+    go.onclick=()=>flashFile(r);
+
+    row.appendChild(left); row.appendChild(ds); row.appendChild(tag); row.appendChild(go);
+    box.appendChild(row);
+  }
+}
+
+async function showFirmware(){
+  const i=await send("INFO");
+  const m=await send("MODE.LIST");
+  // "fw" is the hand-bumped release name. Older firmware has no such field, and
+  // saying so is better than showing a blank or guessing from the build stamp,
+  // which is set when the build was configured rather than compiled.
+  const rev=(i&&i.fw)||null;
+  $("fw-rev").textContent=rev||(i?"older than this panel":"-");
+  $("fw-mode").textContent=(m&&m.modes&&m.modes.find(x=>x.id===m.current)||{}).name||"-";
+  $("fw-writes").textContent=(i&&i.flashw!=null)?i.flashw:"-";
+  serialOpen=true;
+  paintFw(rev);
+  fwStep();
+}
+
+// Flashing is three gestures and they only work in one order, so the panel
+// walks through them rather than offering three buttons that each fail on
+// their own. There is no RP2350 drive to point at until the board is in its
+// bootloader, and each file chooser needs its own click - a browser will not
+// open two pickers from one press.
+let fwChosen=null;    // File to write, once we hold its bytes
+let fwBootSent=false;
+let serialOpen=false;
+
+function fwStep(){
+  const have=!!fwChosen;
+  const boot=fwBootSent;
+  const set=(id,st)=>{const e=$(id);e.className="step"+(st?" "+st:"");};
+  set("st1", have?"done":"now");
+  set("st2", !have?"":(boot?"done":"now"));
+  set("st3", have&&boot?"now":"");
+  $("fwBoot").disabled = !have || !serialOpen;
+  $("fwWrite").disabled = !have;
+  $("sc1").textContent = have
+    ? "Holding "+fwChosen.name+" ("+Math.round(fwChosen.size/1024)+" KB). Pick another to change it."
+    : "Press Flash on a row above, or drag a .uf2 anywhere onto this panel.";
+  $("sc2").textContent = !serialOpen && have && !boot
+    ? "Not connected, so this cannot be sent. Hold the board button while plugging the dongle in instead - that reaches the same place."
+    : "The dongle reboots into its bootloader and appears as a drive called RP2350. It stops being a mouse until a file lands on it.";
+  paintFw();
+}
+
+$("fwBoot").onclick=async()=>{
+  fwBootSent=true;
+  fwState("dropping into the bootloader, look for a drive called RP2350");
+  send("BOOTSEL");
+  fwStep();
+};
+
+// Step 3 does the whole write in one press: ask for the drive if we do not
+// already have it, then copy. One picker, one click, which is all a browser
+// will allow.
+$("fwWrite").onclick=async()=>{
+  if(!fwChosen){ fwState("pick a file first"); return; }
+  if(!fwDrive){
+    if(!window.showDirectoryPicker){
+      fwState("this browser will not choose a drive; drag the file onto RP2350 in Finder");
+      return;
+    }
+    try{
+      fwDrive=await window.showDirectoryPicker({id:"rp2350",mode:"readwrite"});
+    }catch(e){
+      if(e&&e.name==="AbortError"){fwState("");return;}
+      fwState("could not reach that drive; drag the file onto RP2350 in Finder");
+      return;
+    }
+  }
+  if(!/rp2350|rpi-rp2/i.test(fwDrive.name)){
+    // Writing a .uf2 anywhere else does nothing useful and is worth catching.
+    fwState('that is "'+fwDrive.name+'", not the RP2350 drive - press Write again to choose another');
+    fwDrive=null;
+    return;
+  }
+  try{
+    fwState("writing "+fwChosen.name+" to "+fwDrive.name);
+    const dst=await fwDrive.getFileHandle(fwChosen.name,{create:true});
+    const w=await dst.createWritable();
+    await w.write(await fwChosen.arrayBuffer());
+    await w.close();
+    fwState("wrote "+fwChosen.name+" - the board reboots on its own, then re-pair with Create and PS");
+  }catch(e){
+    // The drive vanishing mid-write is what success looks like on RP2350, so
+    // this is reported plainly rather than as a failure.
+    fwState("write ended: "+(e&&e.message?e.message:"drive went away")+
+            " - check whether the board came back");
+  }
+  fwDrive=null;
+};
+
+// Choosing a build. Rows whose bytes we already hold are taken straight; the
+// rest need the file handing over, which is one click and one chooser.
+async function flashFile(r){
+  if(r.file){ fwChosen=r.file; fwState("holding "+r.file.name); fwStep(); return; }
+  if(!window.showOpenFilePicker){
+    fwState("this browser will not open a file; drag it onto this panel instead");
+    return;
+  }
+  try{
+    const [h]=await window.showOpenFilePicker({id:"uf2",multiple:false,
+      types:[{description:"Firmware",accept:{"application/octet-stream":[".uf2"]}}]});
+    const f=await h.getFile();
+    if(!/\.uf2$/i.test(f.name)){ fwState("that is not a .uf2"); return; }
+    fwDropped[f.name]=f; fwChosen=f;
+    fwState("holding "+f.name);
+    fwStep();
+  }catch(e){
+    if(e&&e.name==="AbortError"){fwState("");return;}
+    fwState("could not read that file; drag it onto this panel instead");
+  }
+}
+
+// Dropping a file is the one gesture that hands its contents over with no
+// dialog at all, which is why the whole panel is a target and not just a button.
+function takeFiles(list){
+  let last=null;
+  for(const f of list) if(/\.uf2$/i.test(f.name)){ fwDropped[f.name]=f; last=f; }
+  if(last){ fwChosen=last; fwState("holding "+last.name); fwStep(); }
+  else fwState("nothing there ended in .uf2");
+}
+const fwZone=$("fwPanel");
+for(const ev of ["dragenter","dragover"])
+  fwZone.addEventListener(ev,e=>{e.preventDefault();fwZone.classList.add("drop")});
+for(const ev of ["dragleave","drop"])
+  fwZone.addEventListener(ev,e=>{e.preventDefault();fwZone.classList.remove("drop")});
+fwZone.addEventListener("drop",e=>{
+  if(e.dataTransfer&&e.dataTransfer.files) takeFiles(e.dataTransfer.files);
+});
+$("fwAdd").onclick=()=>$("fwFile").click();
+$("fwFile").addEventListener("change",e=>{takeFiles(e.target.files);e.target.value="";});
+
+paintFw(null);
+fwStep();
+
+$("save").onclick=async()=>{const r=await send("PRESET.SAVE");
+  status(r&&r.ok?"saved to dongle":"save failed",r&&r.ok?"on":"err");refreshPresets();};
+$("cal").onclick=async()=>{await send("MOUSE.CAL");status("sticks recentred","on");};
+$("reset").onclick=async()=>{show(await send("MOUSE.RESET"));status("feel reset","on");};
+$("mapReset").onclick=async()=>{const r=await send("MAP.RESET");
+  if(r&&r.map){map=r.map;paint();status("bindings reset","on");}};
+
+if(!("serial"in navigator)){$("nows").style.display="block";$("connect").disabled=true;}
+buildCallouts();
+
+// The DualSense drawing lives in the document; take a copy before anything can
+// swap it out, so switching back restores exactly what shipped.
+PADS.ds5.svg=$("pad").innerHTML;
+for(const b of $("seg-pad").children) b.onclick=()=>setPad(b.dataset.v);
+let padStart="ds5";
+try{ const k=localStorage.getItem("padKey"); if(PADS[k]) padStart=k; }catch(e){}
+setPad(padStart);
+let start="buttons";
+try{
+  const saved=localStorage.getItem("pb.screen");
+  if(saved&&document.querySelector('.screen[data-screen="'+saved+'"]')) start=saved;
+}catch(e){}
+showScreen(start);
+show({speed:3600,scroll_v:14,scroll_h:10,curve:40,scroll_curve:75,precision:30,
+      turbo:250,fine:18,touch_speed:55,dial_pct:25,
+      stick_mode:0,touch_mode:1,dial_source:0,
+      gyro_mode:0,gyro_orient:1,gyro_gate:1,gyro_sens:25});
+</script>

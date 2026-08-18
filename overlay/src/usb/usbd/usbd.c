@@ -1,0 +1,2379 @@
+// usbd.c - USB device output
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024 Robert Dale Smith
+//
+// Implements USB device mode for Joypad, enabling the adapter to emulate
+// a gamepad for USB-capable consoles. Uses TinyUSB device stack.
+//
+// Supports multiple output modes:
+// - HID (DInput/PS3-compatible) - default
+// - Xbox Original (XID protocol)
+// - Future: XInput, PS4, Switch, etc.
+//
+// Mode is stored in flash and can be changed via CDC commands.
+// Mode changes require USB re-enumeration (device reset).
+
+#include "usbd.h"
+#include "usbd_mode.h"
+#if defined(CONFIG_JOYBUS_BRIDGE) || defined(JOYPAD_USB_FAST_CLOCK)
+#include "hardware/clocks.h"  // set_sys_clock_khz — see clock policy in usbd_init
+#endif
+#include "descriptors/hid_descriptors.h"
+#include "descriptors/sinput_descriptors.h"
+#include "descriptors/xbox_og_descriptors.h"
+#include "descriptors/xinput_descriptors.h"
+#include "descriptors/switch_descriptors.h"
+#include "descriptors/ps3_descriptors.h"
+#include "descriptors/psclassic_descriptors.h"
+#include "descriptors/ps4_descriptors.h"
+#include "descriptors/xbone_descriptors.h"
+#include "descriptors/xac_descriptors.h"
+#include "descriptors/kbmouse_descriptors.h"
+#include "descriptors/gc_adapter_descriptors.h"
+#if CFG_TUD_VENDOR && defined(CONFIG_JOYBUS_BRIDGE)
+#include "descriptors/gba_link_descriptors.h"
+#endif
+#include "descriptors/pcemini_descriptors.h"
+#include "kbmouse/kbmouse.h"
+#include "drivers/tud_xid.h"
+#include "drivers/tud_xinput.h"
+#include "drivers/tud_xbone.h"
+#include "cdc/cdc.h"
+#include "cdc/cdc_commands.h"
+#include "core/router/router.h"
+#include "core/input_event.h"
+#include "core/buttons.h"
+#include "core/services/storage/flash.h"
+#include "core/services/button/button.h"
+#include "core/services/profiles/profile.h"
+#ifndef DISABLE_USB_HOST
+#include "usb/usbh/hid/devices/vendors/sony/sony_ds4.h"
+#endif
+#ifdef ENABLE_PS4_LOCAL_AUTH
+#include "usb/usbd/modes/ps4_local_auth.h"
+#endif
+#include "tusb.h"
+#include "device/usbd_pvt.h"
+#include "platform/platform.h"
+#include <string.h>
+#include <stdio.h>
+
+// ============================================================================
+// STATE
+// ============================================================================
+
+// Current HID report (for HID mode)
+static joypad_hid_report_t hid_report;
+
+// XID state is now in modes/xid_mode.c
+
+// XInput state is now in modes/xinput_mode.c
+
+// Switch state is now in modes/switch_mode.c
+
+// PS3 state is now in modes/ps3_mode.c
+
+// PSClassic state is now in modes/psclassic_mode.c
+// PS4 state is now in modes/ps4_mode.c
+// XID state is now in modes/xid_mode.c
+// Xbox One state is now in modes/xbone_mode.c
+// XAC state is now in modes/xac_mode.c
+// KB/Mouse state is now in modes/kbmouse_mode.c
+// GC Adapter state is now in modes/gc_adapter_mode.c
+
+// ============================================================================
+// EVENT-DRIVEN OUTPUT STATE
+// ============================================================================
+
+// Pending input events (queued by tap callback, sent when USB ready)
+#define USB_MAX_PLAYERS 4
+static input_event_t pending_events[USB_MAX_PLAYERS];
+static bool pending_flags[USB_MAX_PLAYERS] = {false};
+
+// Serial number from board unique ID (12 hex chars + null)
+#define USB_SERIAL_LEN 12
+static char usb_serial_str[USB_SERIAL_LEN + 1];
+
+// Current output mode — override per-app via -DUSBD_DEFAULT_MODE=USB_OUTPUT_MODE_xxx
+#ifndef USBD_DEFAULT_MODE
+#  if defined(CONFIG_USB2BLE) || defined(CONFIG_NGC)
+#    define USBD_DEFAULT_MODE USB_OUTPUT_MODE_CDC
+#  else
+#    define USBD_DEFAULT_MODE USB_OUTPUT_MODE_SINPUT
+#  endif
+#endif
+static usb_output_mode_t output_mode = USBD_DEFAULT_MODE;
+
+// Forward declaration (defined in CONFIGURATION DESCRIPTOR section)
+static void build_config_descriptors(void);
+
+// Mode names for display
+static const char* mode_names[] = {
+    [USB_OUTPUT_MODE_HID] = "DInput",
+    [USB_OUTPUT_MODE_SINPUT] = "SInput",
+    [USB_OUTPUT_MODE_XBOX_ORIGINAL] = "Xbox Original (XID)",
+    [USB_OUTPUT_MODE_XINPUT] = "XInput",
+    [USB_OUTPUT_MODE_PS3] = "PS3",
+    [USB_OUTPUT_MODE_PS4] = "PS4",
+    [USB_OUTPUT_MODE_SWITCH] = "Switch",
+    [USB_OUTPUT_MODE_PSCLASSIC] = "PS Classic",
+    [USB_OUTPUT_MODE_XBONE] = "Xbox One",
+    [USB_OUTPUT_MODE_XAC] = "XAC Compat",
+    [USB_OUTPUT_MODE_KEYBOARD_MOUSE] = "KB/Mouse",
+    [USB_OUTPUT_MODE_GC_ADAPTER] = "GC Adapter",
+    [USB_OUTPUT_MODE_PCEMINI] = "PCE Mini",
+    [USB_OUTPUT_MODE_CDC] = "CDC Config",
+    [USB_OUTPUT_MODE_GBA_LINK] = "GBA Link (Dolphin)",
+};
+
+// ============================================================================
+// MODE REGISTRY
+// ============================================================================
+
+// Mode registry array (populated by usbd_register_modes)
+const usbd_mode_t* usbd_modes[USB_OUTPUT_MODE_COUNT] = {0};
+
+// Current active mode pointer
+static const usbd_mode_t* current_mode = NULL;
+
+void usbd_register_modes(void)
+{
+    // Register all implemented modes
+    usbd_modes[USB_OUTPUT_MODE_HID] = &hid_mode;
+    usbd_modes[USB_OUTPUT_MODE_SINPUT] = &sinput_mode;
+#if CFG_TUD_XINPUT
+    usbd_modes[USB_OUTPUT_MODE_XINPUT] = &xinput_mode;
+#endif
+    usbd_modes[USB_OUTPUT_MODE_SWITCH] = &switch_mode;
+    usbd_modes[USB_OUTPUT_MODE_PS3] = &ps3_mode;
+    usbd_modes[USB_OUTPUT_MODE_PSCLASSIC] = &psclassic_mode;
+    usbd_modes[USB_OUTPUT_MODE_PS4] = &ps4_mode;
+    usbd_modes[USB_OUTPUT_MODE_XBOX_ORIGINAL] = &xid_mode;
+    usbd_modes[USB_OUTPUT_MODE_XBONE] = &xbone_mode;
+    usbd_modes[USB_OUTPUT_MODE_XAC] = &xac_mode;
+    usbd_modes[USB_OUTPUT_MODE_KEYBOARD_MOUSE] = &kbmouse_mode;
+    usbd_modes[USB_OUTPUT_MODE_PCEMINI] = &pcemini_mode;
+#if CFG_TUD_GC_ADAPTER
+    usbd_modes[USB_OUTPUT_MODE_GC_ADAPTER] = &gc_adapter_mode;
+#endif
+#if CFG_TUD_VENDOR && defined(CONFIG_JOYBUS_BRIDGE)
+    usbd_modes[USB_OUTPUT_MODE_GBA_LINK] = &gba_link_mode;
+#endif
+}
+
+const usbd_mode_t* usbd_get_current_mode(void)
+{
+    return current_mode;
+}
+
+// ============================================================================
+// PROFILE PROCESSING
+// ============================================================================
+
+// Apply profile mapping (combos, button remaps) to input event
+// Returns the processed buttons; analog values are updated in-place in profile_out
+static uint32_t apply_usbd_profile_player(const input_event_t* event, profile_output_t* profile_out, uint8_t player_index)
+{
+    const profile_t* profile = profile_get_active(OUTPUT_TARGET_USB_DEVICE);
+
+    profile_apply(profile,
+                  event->buttons,
+                  event->analog[ANALOG_LX], event->analog[ANALOG_LY],
+                  event->analog[ANALOG_RX], event->analog[ANALOG_RY],
+                  event->analog[ANALOG_L2], event->analog[ANALOG_R2],
+                  event->analog[ANALOG_RZ],
+                  profile_out);
+
+    // Custom profile (button remap, stick sensitivity, SOCD, axis inversion,
+    // thresholds) is applied in router_submit_input() so it works uniformly
+    // across all output interfaces.
+
+    // Copy motion data through (no remapping)
+    profile_out->has_motion = event->has_motion;
+    if (event->has_motion) {
+        profile_out->accel[0] = event->accel[0];
+        profile_out->accel[1] = event->accel[1];
+        profile_out->accel[2] = event->accel[2];
+        profile_out->gyro[0] = event->gyro[0];
+        profile_out->gyro[1] = event->gyro[1];
+        profile_out->gyro[2] = event->gyro[2];
+    }
+
+    // Copy pressure data through (no remapping)
+    profile_out->has_pressure = event->has_pressure;
+    if (event->has_pressure) {
+        for (int i = 0; i < 12; i++) {
+            profile_out->pressure[i] = event->pressure[i];
+        }
+    }
+
+    // Stream output to CDC for web config (if enabled)
+    // This shows the processed output values after profile mapping
+    uint8_t output_axes[7] = {
+        profile_out->left_x, profile_out->left_y,
+        profile_out->right_x, profile_out->right_y,
+        profile_out->l2_analog, profile_out->r2_analog,
+        profile_out->rz_analog
+    };
+    cdc_commands_send_player_output(player_index, profile_out->buttons, output_axes);
+
+    return profile_out->buttons;
+}
+
+// ============================================================================
+// CONVERSION HELPERS
+// ============================================================================
+
+// Convert input_event buttons to HID gamepad buttons (18 buttons)
+static uint32_t convert_buttons(uint32_t buttons)
+{
+    uint32_t hid_buttons = 0;
+
+    // Joypad uses active-high (1 = pressed), HID uses active-high (1 = pressed)
+    // No inversion needed
+
+    if (buttons & JP_BUTTON_B1) hid_buttons |= USB_GAMEPAD_MASK_B1;
+    if (buttons & JP_BUTTON_B2) hid_buttons |= USB_GAMEPAD_MASK_B2;
+    if (buttons & JP_BUTTON_B3) hid_buttons |= USB_GAMEPAD_MASK_B3;
+    if (buttons & JP_BUTTON_B4) hid_buttons |= USB_GAMEPAD_MASK_B4;
+    if (buttons & JP_BUTTON_L1) hid_buttons |= USB_GAMEPAD_MASK_L1;
+    if (buttons & JP_BUTTON_R1) hid_buttons |= USB_GAMEPAD_MASK_R1;
+    if (buttons & JP_BUTTON_L2) hid_buttons |= USB_GAMEPAD_MASK_L2;
+    if (buttons & JP_BUTTON_R2) hid_buttons |= USB_GAMEPAD_MASK_R2;
+    if (buttons & JP_BUTTON_S1) hid_buttons |= USB_GAMEPAD_MASK_S1;
+    if (buttons & JP_BUTTON_S2) hid_buttons |= USB_GAMEPAD_MASK_S2;
+    if (buttons & JP_BUTTON_L3) hid_buttons |= USB_GAMEPAD_MASK_L3;
+    if (buttons & JP_BUTTON_R3) hid_buttons |= USB_GAMEPAD_MASK_R3;
+    if (buttons & JP_BUTTON_A1) hid_buttons |= USB_GAMEPAD_MASK_A1;
+    if (buttons & JP_BUTTON_A2) hid_buttons |= USB_GAMEPAD_MASK_A2;
+    if (buttons & JP_BUTTON_A3) hid_buttons |= USB_GAMEPAD_MASK_A3;
+    if (buttons & JP_BUTTON_A4) hid_buttons |= USB_GAMEPAD_MASK_A4;
+    if (buttons & JP_BUTTON_L4) hid_buttons |= USB_GAMEPAD_MASK_L4;
+    if (buttons & JP_BUTTON_R4) hid_buttons |= USB_GAMEPAD_MASK_R4;
+
+    return hid_buttons;
+}
+
+// Convert input_event dpad to HID hat switch
+static uint8_t convert_dpad_to_hat(uint32_t buttons)
+{
+    // Joypad uses active-high (1 = pressed)
+    uint8_t up = (buttons & JP_BUTTON_DU) ? 1 : 0;
+    uint8_t down = (buttons & JP_BUTTON_DD) ? 1 : 0;
+    uint8_t left = (buttons & JP_BUTTON_DL) ? 1 : 0;
+    uint8_t right = (buttons & JP_BUTTON_DR) ? 1 : 0;
+
+    if (up && right) return HID_HAT_UP_RIGHT;
+    if (up && left) return HID_HAT_UP_LEFT;
+    if (down && right) return HID_HAT_DOWN_RIGHT;
+    if (down && left) return HID_HAT_DOWN_LEFT;
+    if (up) return HID_HAT_UP;
+    if (down) return HID_HAT_DOWN;
+    if (left) return HID_HAT_LEFT;
+    if (right) return HID_HAT_RIGHT;
+
+    return HID_HAT_CENTER;
+}
+
+// ============================================================================
+// XID CONVERSION HELPERS (Xbox Original mode)
+// ============================================================================
+
+// Convert Joypad buttons to Xbox OG digital buttons (byte 2)
+static uint8_t convert_xid_digital_buttons(uint32_t buttons)
+{
+    uint8_t xog_buttons = 0;
+
+    if (buttons & JP_BUTTON_DU) xog_buttons |= XBOX_OG_BTN_DPAD_UP;
+    if (buttons & JP_BUTTON_DD) xog_buttons |= XBOX_OG_BTN_DPAD_DOWN;
+    if (buttons & JP_BUTTON_DL) xog_buttons |= XBOX_OG_BTN_DPAD_LEFT;
+    if (buttons & JP_BUTTON_DR) xog_buttons |= XBOX_OG_BTN_DPAD_RIGHT;
+    if (buttons & JP_BUTTON_S2) xog_buttons |= XBOX_OG_BTN_START;
+    if (buttons & JP_BUTTON_S1) xog_buttons |= XBOX_OG_BTN_BACK;
+    if (buttons & JP_BUTTON_L3) xog_buttons |= XBOX_OG_BTN_L3;
+    if (buttons & JP_BUTTON_R3) xog_buttons |= XBOX_OG_BTN_R3;
+
+    return xog_buttons;
+}
+
+// Convert analog value from Joypad (0-255, center 128) to Xbox OG signed 16-bit
+static int16_t convert_axis_to_s16(uint8_t value)
+{
+    int32_t scaled = ((int32_t)value - 128) * 256;
+    if (scaled < -32768) scaled = -32768;
+    if (scaled > 32767) scaled = 32767;
+    return (int16_t)scaled;
+}
+
+// Convert and invert axis (for Y-axis where convention differs)
+// Uses 32-bit math to avoid -32768 negation overflow
+static int16_t convert_axis_to_s16_inverted(uint8_t value)
+{
+    int32_t scaled = -((int32_t)value - 128) * 256;
+    if (scaled < -32768) scaled = -32768;
+    if (scaled > 32767) scaled = 32767;
+    return (int16_t)scaled;
+}
+
+// ============================================================================
+// MODE SELECTION API
+// ============================================================================
+
+usb_output_mode_t usbd_get_mode(void)
+{
+    return output_mode;
+}
+
+// Helper to flush debug output over CDC
+static void flush_debug_output(void)
+{
+#ifdef PLATFORM_ESP32
+    tud_task_ext(1, false);
+    platform_sleep_ms(20);
+    tud_task_ext(1, false);
+#else
+    tud_task();
+    platform_sleep_ms(20);
+    tud_task();
+#endif
+}
+
+bool usbd_set_mode(usb_output_mode_t mode)
+{
+    if (mode >= USB_OUTPUT_MODE_COUNT) {
+        return false;
+    }
+
+#ifdef CONFIG_NGC
+    // GameCube config mode: CDC-only, no mode switching allowed
+    if (mode != USB_OUTPUT_MODE_CDC) {
+        printf("[usbd] Mode switching disabled (GameCube CDC-only)\n");
+        return false;
+    }
+#endif
+
+    // Supported modes: SInput, HID, Xbox OG, XInput, PS3, PS4, Switch, PS Classic, Xbox One, XAC, KB/Mouse, GC Adapter
+    if (mode != USB_OUTPUT_MODE_SINPUT &&
+        mode != USB_OUTPUT_MODE_HID &&
+        mode != USB_OUTPUT_MODE_XBOX_ORIGINAL &&
+        mode != USB_OUTPUT_MODE_XINPUT &&
+        mode != USB_OUTPUT_MODE_PS3 &&
+        mode != USB_OUTPUT_MODE_PS4 &&
+        mode != USB_OUTPUT_MODE_SWITCH &&
+        mode != USB_OUTPUT_MODE_PSCLASSIC &&
+        mode != USB_OUTPUT_MODE_XBONE &&
+        mode != USB_OUTPUT_MODE_XAC &&
+        mode != USB_OUTPUT_MODE_KEYBOARD_MOUSE &&
+        mode != USB_OUTPUT_MODE_GC_ADAPTER &&
+        mode != USB_OUTPUT_MODE_PCEMINI &&
+#if CFG_TUD_VENDOR && defined(CONFIG_JOYBUS_BRIDGE)
+        mode != USB_OUTPUT_MODE_GBA_LINK &&
+#endif
+        mode != USB_OUTPUT_MODE_CDC) {
+        printf("[usbd] Mode %d not yet supported\n", mode);
+        return false;
+    }
+
+    if (mode == output_mode) {
+        return false;  // Same mode, no change needed
+    }
+
+    printf("[usbd] Changing mode from %s to %s\n",
+           mode_names[output_mode], mode_names[mode]);
+    flush_debug_output();
+
+    // Fast switch: SInput <-> KB/Mouse share the same USB descriptor (composite device)
+    // No re-enumeration needed — just switch the mode logic
+    bool is_sinput_family_old = (output_mode == USB_OUTPUT_MODE_SINPUT ||
+                                  output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE);
+    bool is_sinput_family_new = (mode == USB_OUTPUT_MODE_SINPUT ||
+                                  mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE);
+    if (is_sinput_family_old && is_sinput_family_new) {
+        printf("[usbd] Fast switch (same USB descriptor)\n");
+        flush_debug_output();
+
+        output_mode = mode;
+        flash_t* settings = flash_get_settings();
+        if (settings) {
+            settings->usb_output_mode = (uint8_t)mode;
+            flash_save_force(settings);
+        }
+
+        // Re-init the new mode
+        const usbd_mode_t* new_mode = usbd_modes[mode];
+        if (new_mode && new_mode->init) {
+            new_mode->init();
+        }
+        current_mode = new_mode;
+
+        printf("[usbd] Fast switch complete: %s\n", mode_names[mode]);
+        return true;
+    }
+
+    // Save mode to flash immediately (we're about to reset)
+    // Use runtime settings (not local copy) to preserve custom profiles
+    flash_t* settings = flash_get_settings();
+    if (settings) {
+        settings->usb_output_mode = (uint8_t)mode;
+        flash_save_force(settings);
+    }
+
+    output_mode = mode;
+
+    // Brief delay to allow flash write to complete
+    platform_sleep_ms(50);
+
+    // Trigger device reset to re-enumerate with new descriptors. The CH32 USBHS
+    // re-enumerates cleanly only via a full reset (a live pull-up toggle leaves
+    // the SIE unable to re-attach); the saved mode survives the reset because the
+    // CH32 settings buffer lives in a .noinit section (see flash_wch.c).
+    printf("[usbd] Resetting device for re-enumeration...\n");
+    flush_debug_output();
+    platform_reboot();
+
+    return true;  // Never reached
+}
+
+const char* usbd_get_mode_name(usb_output_mode_t mode)
+{
+    if (mode < USB_OUTPUT_MODE_COUNT) {
+        return mode_names[mode];
+    }
+    return "Unknown";
+}
+
+void usbd_get_mode_color(usb_output_mode_t mode, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    switch (mode) {
+        case USB_OUTPUT_MODE_XINPUT:
+        case USB_OUTPUT_MODE_XBOX_ORIGINAL:
+        case USB_OUTPUT_MODE_XBONE:
+        case USB_OUTPUT_MODE_XAC:
+            *r = 0; *g = 64; *b = 0; break;     // green
+        case USB_OUTPUT_MODE_PS3:
+        case USB_OUTPUT_MODE_PSCLASSIC:
+            *r = 0; *g = 0; *b = 40; break;      // dim blue
+        case USB_OUTPUT_MODE_PS4:
+            *r = 0; *g = 0; *b = 80; break;      // bright blue
+        case USB_OUTPUT_MODE_SWITCH:
+            *r = 64; *g = 0; *b = 0; break;      // red
+        case USB_OUTPUT_MODE_KEYBOARD_MOUSE:
+            *r = 64; *g = 64; *b = 0; break;     // yellow
+        case USB_OUTPUT_MODE_PCEMINI:
+            *r = 0; *g = 0; *b = 64; break;      // blue
+        case USB_OUTPUT_MODE_SINPUT:
+            // White stacks all 3 channels — keep per-channel low so the
+            // total brightness matches (and undercuts) the single-channel
+            // mode colors. Even at 10/ch the perceived output is bright.
+            *r = 10; *g = 10; *b = 10; break;    // dim white
+        case USB_OUTPUT_MODE_CDC:
+            *r = 0; *g = 64; *b = 64; break;     // cyan
+        default: // HID, GC_ADAPTER
+            *r = 6; *g = 0; *b = 64; break;      // purple
+    }
+}
+
+usb_output_mode_t usbd_get_next_mode(void)
+{
+#ifdef CONFIG_NGC
+    // GameCube config mode: CDC-only, no mode cycling
+    return USB_OUTPUT_MODE_CDC;
+#else
+    // Cycle through common modes: SInput → XInput → PS3 → PS4 → Switch → KB/Mouse → SInput
+    // (Skip less common: DInput, PS Classic, Xbox Original, Xbox One, XAC)
+    switch (output_mode) {
+        case USB_OUTPUT_MODE_SINPUT:
+            return USB_OUTPUT_MODE_XINPUT;
+        case USB_OUTPUT_MODE_XINPUT:
+            return USB_OUTPUT_MODE_PS3;
+        case USB_OUTPUT_MODE_PS3:
+            return USB_OUTPUT_MODE_PS4;
+        case USB_OUTPUT_MODE_PS4:
+            return USB_OUTPUT_MODE_SWITCH;
+        case USB_OUTPUT_MODE_SWITCH:
+            return USB_OUTPUT_MODE_KEYBOARD_MOUSE;
+        case USB_OUTPUT_MODE_KEYBOARD_MOUSE:
+        default:
+            return USB_OUTPUT_MODE_SINPUT;
+    }
+#endif
+}
+
+bool usbd_reset_to_hid(void)
+{
+#ifdef CONFIG_NGC
+    return false;  // GameCube config mode: no mode reset
+#else
+    // Reset to SInput (the new default, replacing DInput)
+    if (output_mode != USB_OUTPUT_MODE_SINPUT) {
+        usbd_set_mode(USB_OUTPUT_MODE_SINPUT);
+        return true;
+    }
+    return false;
+#endif
+}
+
+// ============================================================================
+// EVENT-DRIVEN TAP CALLBACK
+// ============================================================================
+
+// Called by router immediately when input arrives (push-based notification)
+static void usbd_on_input(output_target_t output, uint8_t player_index, const input_event_t* event)
+{
+    (void)output;  // Always USB_DEVICE
+
+    if (player_index >= USB_MAX_PLAYERS || !event) {
+        return;
+    }
+
+    // Check for profile switch combo (SELECT + D-pad Up/Down after 2s hold)
+    // This enables hotkey profile cycling for both built-in and custom profiles
+    if (player_index == 0) {
+        profile_check_switch_combo(event->buttons);
+    }
+
+    // Queue the event for sending when USB is ready
+    pending_events[player_index] = *event;
+    pending_flags[player_index] = true;
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+void usbd_init(void)
+{
+#ifdef DISABLE_USB_DEVICE
+    printf("[usbd] USB device DISABLED\n");
+    return;
+#endif
+#if defined(CONFIG_JOYBUS_BRIDGE)
+    // Joybus-bridge apps need 130 MHz before tusb_init AND before
+    // gc_host_init so USB SOF timing and the joybus PIO divider both
+    // see the final clock. Without this, the divider ends up ~4% off
+    // and GBA replies never decode (rx=000000 timeouts).
+    bool clk_ok = set_sys_clock_khz(130000, true);
+    printf("[usbd] sys_clock=130MHz set: %s\n", clk_ok ? "OK" : "FAIL");
+#elif defined(JOYPAD_USB_FAST_CLOCK)
+    // USB-output controller-emulation apps run at 200 MHz — the fastest
+    // build-supported clock, same value GP2040-CE uses — so PS4 local-auth
+    // RSA signing completes inside the console's ~challenge window (~1.7 s vs
+    // ~3.4 s at 125 MHz). Set here, once, before the USB stack starts: this is
+    // a board-level clock policy, not a per-driver runtime hack. Console-output
+    // and native-input apps never call usbd_init(), so they keep their own
+    // tuned clocks. Scoped in CMake (JOYPAD_USB_FAST_CLOCK) to wired RP2 apps.
+    bool clk_ok = set_sys_clock_khz(200000, true);
+    printf("[usbd] sys_clock=200MHz set: %s\n", clk_ok ? "OK" : "FAIL");
+#endif
+    printf("[usbd] Initializing USB device output\n");
+
+    // Register all mode implementations
+    usbd_register_modes();
+
+    // Initialize and load settings from flash
+    flash_init();
+#ifdef ENABLE_PS4_LOCAL_AUTH
+    // Load PS4 auth key material from flash (requires flash_init to have run first)
+    ps4_local_auth_init();
+#endif
+    // Load saved mode from flash (runtime_settings holds the canonical state)
+    flash_t* settings = flash_get_settings();
+    if (settings) {
+        printf("[usbd] Flash load success! usb_output_mode=%d, active_profile=%d\n",
+               settings->usb_output_mode, settings->active_profile_index);
+        // Validate loaded mode
+        if (settings->usb_output_mode < USB_OUTPUT_MODE_COUNT) {
+            // Only accept supported modes
+            if (settings->usb_output_mode == USB_OUTPUT_MODE_SINPUT ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_XBOX_ORIGINAL ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_XINPUT ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_PS3 ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_PS4 ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_SWITCH ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_PSCLASSIC ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_XBONE ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_XAC ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_GC_ADAPTER ||
+                settings->usb_output_mode == USB_OUTPUT_MODE_PCEMINI ||
+#if CFG_TUD_VENDOR && defined(CONFIG_JOYBUS_BRIDGE)
+                settings->usb_output_mode == USB_OUTPUT_MODE_GBA_LINK ||
+#endif
+                settings->usb_output_mode == USB_OUTPUT_MODE_CDC) {
+                output_mode = (usb_output_mode_t)settings->usb_output_mode;
+                printf("[usbd] Loaded mode from flash: %s\n", mode_names[output_mode]);
+            } else if (settings->usb_output_mode == USB_OUTPUT_MODE_HID) {
+                // DInput (mode 0) is deprecated / uninitialized flash default.
+                // Keep compile-time default (SInput for usb2usb, CDC for usb2ble).
+                printf("[usbd] Flash has DInput (0), keeping default: %s\n", mode_names[output_mode]);
+            } else {
+                printf("[usbd] Unsupported mode %d in flash, using default\n",
+                       settings->usb_output_mode);
+            }
+        }
+    } else {
+        printf("[usbd] No valid flash settings, using defaults\n");
+    }
+
+#ifdef CONFIG_NGC
+    // GameCube config mode: always force CDC-only (ignore flash-saved mode)
+    output_mode = USB_OUTPUT_MODE_CDC;
+#endif
+    printf("[usbd] Mode: %s\n", mode_names[output_mode]);
+
+    // Build runtime config descriptors (must happen before tusb_init)
+    build_config_descriptors();
+
+    // Get unique board ID for USB serial number (first 12 chars)
+    char full_id[17];  // Up to 8 bytes * 2 hex chars + null
+    platform_get_serial(full_id, sizeof(full_id));
+    memcpy(usb_serial_str, full_id, USB_SERIAL_LEN);
+    usb_serial_str[USB_SERIAL_LEN] = '\0';
+    printf("[usbd] Serial: %s\n", usb_serial_str);
+
+    // Initialize TinyUSB device stack
+    tusb_rhport_init_t dev_init = {
+        .role = TUSB_ROLE_DEVICE,
+        .speed = (output_mode == USB_OUTPUT_MODE_XBOX_ORIGINAL)
+                 ? TUSB_SPEED_FULL  // Xbox OG is USB 1.1
+                 : TUSB_SPEED_AUTO
+    };
+    tusb_init(0, &dev_init);
+
+    // Initialize reports based on mode
+    switch (output_mode) {
+        case USB_OUTPUT_MODE_XBOX_ORIGINAL:
+            // XID mode: delegate to mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_XBOX_ORIGINAL] && usbd_modes[USB_OUTPUT_MODE_XBOX_ORIGINAL]->init) {
+                usbd_modes[USB_OUTPUT_MODE_XBOX_ORIGINAL]->init();
+            }
+            break;
+
+        case USB_OUTPUT_MODE_XINPUT:
+            // XInput mode: delegate to mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_XINPUT] && usbd_modes[USB_OUTPUT_MODE_XINPUT]->init) {
+                usbd_modes[USB_OUTPUT_MODE_XINPUT]->init();
+            }
+            break;
+
+        case USB_OUTPUT_MODE_SWITCH:
+            // Switch mode: delegate to mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_SWITCH] && usbd_modes[USB_OUTPUT_MODE_SWITCH]->init) {
+                usbd_modes[USB_OUTPUT_MODE_SWITCH]->init();
+            }
+            break;
+
+        case USB_OUTPUT_MODE_PS3:
+            // PS3 mode: delegate to mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_PS3] && usbd_modes[USB_OUTPUT_MODE_PS3]->init) {
+                usbd_modes[USB_OUTPUT_MODE_PS3]->init();
+            }
+            break;
+
+        case USB_OUTPUT_MODE_PSCLASSIC:
+            // PSClassic mode: delegate to mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_PSCLASSIC] && usbd_modes[USB_OUTPUT_MODE_PSCLASSIC]->init) {
+                usbd_modes[USB_OUTPUT_MODE_PSCLASSIC]->init();
+            }
+            break;
+
+        case USB_OUTPUT_MODE_PS4:
+            // PS4 mode: delegate to mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_PS4] && usbd_modes[USB_OUTPUT_MODE_PS4]->init) {
+                usbd_modes[USB_OUTPUT_MODE_PS4]->init();
+            }
+            break;
+
+        case USB_OUTPUT_MODE_XBONE:
+            // Xbox One mode: delegate to mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_XBONE] && usbd_modes[USB_OUTPUT_MODE_XBONE]->init) {
+                usbd_modes[USB_OUTPUT_MODE_XBONE]->init();
+            }
+            break;
+
+        case USB_OUTPUT_MODE_XAC:
+            // XAC mode: delegate to mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_XAC] && usbd_modes[USB_OUTPUT_MODE_XAC]->init) {
+                usbd_modes[USB_OUTPUT_MODE_XAC]->init();
+            }
+            break;
+
+        case USB_OUTPUT_MODE_KEYBOARD_MOUSE:
+            // KB/Mouse mode: delegate to mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_KEYBOARD_MOUSE] && usbd_modes[USB_OUTPUT_MODE_KEYBOARD_MOUSE]->init) {
+                usbd_modes[USB_OUTPUT_MODE_KEYBOARD_MOUSE]->init();
+            }
+            break;
+
+        case USB_OUTPUT_MODE_GC_ADAPTER:
+            // GC Adapter mode: delegate to mode interface
+#if CFG_TUD_GC_ADAPTER
+            if (usbd_modes[USB_OUTPUT_MODE_GC_ADAPTER] && usbd_modes[USB_OUTPUT_MODE_GC_ADAPTER]->init) {
+                usbd_modes[USB_OUTPUT_MODE_GC_ADAPTER]->init();
+            }
+#endif
+            break;
+
+        case USB_OUTPUT_MODE_PCEMINI:
+            // PCE Mini mode: delegate to mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_PCEMINI] && usbd_modes[USB_OUTPUT_MODE_PCEMINI]->init) {
+                usbd_modes[USB_OUTPUT_MODE_PCEMINI]->init();
+            }
+            break;
+
+        case USB_OUTPUT_MODE_CDC:
+            // CDC-only mode: no HID init needed
+            break;
+
+#if CFG_TUD_VENDOR && defined(CONFIG_JOYBUS_BRIDGE)
+        case USB_OUTPUT_MODE_GBA_LINK:
+            // GBA Link mode: delegate to mode interface (claims joybus
+            // bridge from gc_host, sets up vendor RX/TX dispatch).
+            if (usbd_modes[USB_OUTPUT_MODE_GBA_LINK] && usbd_modes[USB_OUTPUT_MODE_GBA_LINK]->init) {
+                usbd_modes[USB_OUTPUT_MODE_GBA_LINK]->init();
+            }
+            break;
+#endif
+
+        case USB_OUTPUT_MODE_HID:
+            // Initialize HID mode via mode interface
+            if (usbd_modes[USB_OUTPUT_MODE_HID] && usbd_modes[USB_OUTPUT_MODE_HID]->init) {
+                usbd_modes[USB_OUTPUT_MODE_HID]->init();
+            }
+            break;
+
+        case USB_OUTPUT_MODE_SINPUT:
+        default:
+            // Initialize SInput mode via mode interface (new default)
+            if (usbd_modes[USB_OUTPUT_MODE_SINPUT] && usbd_modes[USB_OUTPUT_MODE_SINPUT]->init) {
+                usbd_modes[USB_OUTPUT_MODE_SINPUT]->init();
+            }
+            break;
+    }
+
+    // Set current mode pointer for dispatch
+    current_mode = usbd_modes[output_mode];
+
+    // Initialize CDC subsystem (for SInput, HID, Switch, KB/Mouse, and CDC-only modes)
+    if (output_mode == USB_OUTPUT_MODE_SINPUT || output_mode == USB_OUTPUT_MODE_HID ||
+        output_mode == USB_OUTPUT_MODE_SWITCH || output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE ||
+        output_mode == USB_OUTPUT_MODE_CDC) {
+        cdc_init();
+    }
+
+    // Register tap callback for event-driven input (push-based notification)
+    router_set_tap(OUTPUT_TARGET_USB_DEVICE, usbd_on_input);
+
+    printf("[usbd] Initialization complete\n");
+}
+
+void usbd_task(void)
+{
+    // TinyUSB device task - runs from core0 main loop
+    // On ESP32 (FreeRTOS), tud_task() blocks forever (UINT32_MAX timeout).
+    // Use tud_task_ext with short timeout so the main loop keeps running.
+#ifdef PLATFORM_ESP32
+    tud_task_ext(1, false);
+#else
+    tud_task();
+#endif
+
+    switch (output_mode) {
+        case USB_OUTPUT_MODE_XBOX_ORIGINAL: {
+            // XID mode: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XBOX_ORIGINAL];
+            if (mode) {
+                if (mode->task) mode->task();
+                if (mode->is_ready && mode->is_ready()) {
+                    usbd_send_report(0);
+                }
+            }
+            break;
+        }
+
+#if CFG_TUD_XINPUT
+        case USB_OUTPUT_MODE_XINPUT: {
+            // XInput mode: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XINPUT];
+            if (mode) {
+                if (mode->task) mode->task();
+                if (mode->is_ready && mode->is_ready()) {
+                    usbd_send_report(0);
+                }
+            }
+            break;
+        }
+#endif
+
+        case USB_OUTPUT_MODE_SWITCH: {
+            // Switch mode: process CDC tasks, delegate to mode interface
+            cdc_task();
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_SWITCH];
+            if (mode && mode->is_ready && mode->is_ready()) {
+                usbd_send_report(0);
+            }
+            break;
+        }
+
+        case USB_OUTPUT_MODE_PS3: {
+            // PS3 mode: delegate to mode interface (no CDC — authentic DS3)
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS3];
+            if (mode && mode->is_ready && mode->is_ready()) {
+                usbd_send_report(0);
+            }
+            break;
+        }
+
+        case USB_OUTPUT_MODE_PSCLASSIC: {
+            // PSClassic mode: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PSCLASSIC];
+            if (mode && mode->is_ready && mode->is_ready()) {
+                usbd_send_report(0);
+            }
+            break;
+        }
+
+        case USB_OUTPUT_MODE_PCEMINI: {
+            // PCE Mini mode: process new input first, turbo resend only if idle
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PCEMINI];
+            if (mode) {
+                bool sent = false;
+                if (mode->is_ready && mode->is_ready()) {
+                    sent = usbd_send_report(0);
+                }
+                if (!sent && mode->task) mode->task();
+            }
+            break;
+        }
+
+        case USB_OUTPUT_MODE_PS4: {
+            // PS4 mode: process CDC tasks, run mode task (RSA signing), then send HID report
+            cdc_task();
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS4];
+            if (mode && mode->task) mode->task();
+            if (tud_hid_ready()) {
+                usbd_send_report(0);
+            }
+            break;
+        }
+
+        case USB_OUTPUT_MODE_XBONE: {
+            // Xbox One mode: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XBONE];
+            if (mode) {
+                if (mode->task) mode->task();
+                if (mode->is_ready && mode->is_ready()) {
+                    usbd_send_report(0);
+                }
+            }
+            break;
+        }
+
+        case USB_OUTPUT_MODE_XAC: {
+            // XAC mode: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XAC];
+            if (mode && mode->is_ready && mode->is_ready()) {
+                usbd_send_report(0);
+            }
+            break;
+        }
+
+        case USB_OUTPUT_MODE_KEYBOARD_MOUSE: {
+            // KB/Mouse mode: process CDC tasks, delegate to mode interface
+            cdc_task();
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_KEYBOARD_MOUSE];
+            if (mode && mode->is_ready && mode->is_ready()) {
+                usbd_send_report(0);
+            }
+            break;
+        }
+
+#if CFG_TUD_GC_ADAPTER
+        case USB_OUTPUT_MODE_GC_ADAPTER: {
+            // GC Adapter mode: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_GC_ADAPTER];
+            if (mode) {
+                if (mode->task) mode->task();
+                if (mode->is_ready && mode->is_ready()) {
+                    usbd_send_report(0);
+                }
+            }
+            break;
+        }
+#endif
+
+#if CFG_TUD_VENDOR && defined(CONFIG_JOYBUS_BRIDGE)
+        case USB_OUTPUT_MODE_GBA_LINK: {
+            // GBA Link bridge: process CDC + drain vendor RX → joybus → vendor TX
+            cdc_task();
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_GBA_LINK];
+            if (mode && mode->task) mode->task();
+            // No HID report — vendor mode is bidirectional and event-driven.
+            break;
+        }
+#endif
+
+        case USB_OUTPUT_MODE_CDC:
+            // CDC-only mode: just process CDC tasks (no HID reports)
+            cdc_task();
+            break;
+
+        case USB_OUTPUT_MODE_HID:
+            // HID mode: process CDC tasks
+            cdc_task();
+            // Send HID report if device is ready
+            if (tud_hid_ready()) {
+                usbd_send_report(0);
+            }
+            break;
+
+        case USB_OUTPUT_MODE_SINPUT:
+        default: {
+            // SInput mode: process CDC tasks
+            cdc_task();
+            // Run mode task (handles feature response)
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_SINPUT];
+            if (mode && mode->task) mode->task();
+            // Send SInput report if device is ready
+            if (tud_hid_ready()) {
+                usbd_send_report(0);
+            }
+            break;
+        }
+    }
+}
+
+// Send XID report - delegates to mode interface
+static bool usbd_send_xid_report(uint8_t player_index)
+{
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XBOX_ORIGINAL];
+    if (!mode || !mode->send_report) return false;
+    if (mode->is_ready && !mode->is_ready()) return false;
+
+    // Check for pending event
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        return false;
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;
+
+    // Apply profile
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
+// Send HID report (DInput mode) - uses mode interface
+static bool usbd_send_hid_report(uint8_t player_index)
+{
+    // Use mode interface if available
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_HID];
+    if (!mode || !mode->send_report) {
+        return false;
+    }
+
+    // Check ready via mode interface
+    if (mode->is_ready && !mode->is_ready()) {
+        return false;
+    }
+
+    // Check for pending event (event-driven from tap callback)
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        return false;
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;  // Clear after consumption
+
+    // Apply profile (combos, button remaps)
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    // Delegate to mode implementation
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
+// Send SInput report - uses mode interface
+static bool usbd_send_sinput_report(uint8_t player_index)
+{
+    // Use mode interface if available
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_SINPUT];
+    if (!mode || !mode->send_report) {
+        return false;
+    }
+
+    // Check ready via mode interface
+    if (mode->is_ready && !mode->is_ready()) {
+        return false;
+    }
+
+    // Check for pending event (event-driven from tap callback)
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        return false;
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;  // Clear after consumption
+
+    // Apply profile (combos, button remaps)
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    // Delegate to mode implementation
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
+#if CFG_TUD_XINPUT
+// Send XInput report (Xbox 360 mode) - uses mode interface
+static bool usbd_send_xinput_report(uint8_t player_index)
+{
+    // Use mode interface
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XINPUT];
+    if (!mode || !mode->send_report) {
+        return false;
+    }
+
+    // Check ready via mode interface
+    if (mode->is_ready && !mode->is_ready()) {
+        return false;
+    }
+
+    // Check for pending event (event-driven from tap callback)
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        return false;
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;  // Clear after consumption
+
+    // Apply profile (combos, button remaps)
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    // Delegate to mode implementation
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+#endif
+
+// Send Switch report (Nintendo Switch mode) - uses mode interface
+static bool usbd_send_switch_report(uint8_t player_index)
+{
+    // Use mode interface
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_SWITCH];
+    if (!mode || !mode->send_report) {
+        return false;
+    }
+
+    // Check ready via mode interface
+    if (mode->is_ready && !mode->is_ready()) {
+        return false;
+    }
+
+    // Check for pending event (event-driven from tap callback)
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        return false;
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;  // Clear after consumption
+
+    // Apply profile (combos, button remaps)
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    // Delegate to mode implementation
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
+// Send PS3 report (PlayStation 3 DualShock 3 mode) - uses mode interface
+static bool usbd_send_ps3_report(uint8_t player_index)
+{
+    // Use mode interface
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS3];
+    if (!mode || !mode->send_report) {
+        return false;
+    }
+
+    // Check ready via mode interface
+    if (mode->is_ready && !mode->is_ready()) {
+        return false;
+    }
+
+    // Check for pending event (event-driven from tap callback)
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        return false;
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;  // Clear after consumption
+
+    // Apply profile (combos, button remaps)
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    // Delegate to mode implementation
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
+// Send PS Classic report - uses mode interface
+static bool usbd_send_psclassic_report(uint8_t player_index)
+{
+    // Use mode interface
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PSCLASSIC];
+    if (!mode || !mode->send_report) {
+        return false;
+    }
+
+    // Check ready via mode interface
+    if (mode->is_ready && !mode->is_ready()) {
+        return false;
+    }
+
+    // Check for pending event (event-driven from tap callback)
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        return false;
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;  // Clear after consumption
+
+    // Apply profile (combos, button remaps)
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    // Delegate to mode implementation
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
+// Send PCE Mini report - delegates to mode interface
+static bool usbd_send_pcemini_report(uint8_t player_index)
+{
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PCEMINI];
+    if (!mode || !mode->send_report) return false;
+    if (mode->is_ready && !mode->is_ready()) return false;
+
+    // Check for pending event
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        return false;
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;
+
+    // Apply profile
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
+// Send PS4 report - delegates to mode interface
+static bool usbd_send_ps4_report(uint8_t player_index)
+{
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS4];
+    if (!mode || !mode->send_report) return false;
+    if (mode->is_ready && !mode->is_ready()) return false;
+
+    // Check for pending event
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        return false;
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;
+
+    // Apply profile
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
+// Send Xbox One report - delegates to mode interface
+static bool usbd_send_xbone_report(uint8_t player_index)
+{
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XBONE];
+    if (!mode || !mode->send_report) return false;
+    if (mode->is_ready && !mode->is_ready()) return false;
+
+    // Check for pending event
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        return false;
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;
+
+    // Apply profile
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
+// Send XAC report - delegates to mode interface
+static bool usbd_send_xac_report(uint8_t player_index)
+{
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XAC];
+    if (!mode || !mode->send_report) return false;
+    if (mode->is_ready && !mode->is_ready()) return false;
+
+    // Check for pending event
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        return false;
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;
+
+    // Apply profile
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
+// Send keyboard/mouse reports - delegates to mode interface
+static bool usbd_send_kbmouse_report(uint8_t player_index)
+{
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_KEYBOARD_MOUSE];
+    if (!mode || !mode->send_report) return false;
+    if (mode->is_ready && !mode->is_ready()) return false;
+
+    // Check for pending event
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        // No new input, but still send mouse report for continuous movement
+        return kbmouse_mode_send_idle_mouse();
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;
+
+    // Apply profile
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+
+#if CFG_TUD_GC_ADAPTER
+// Send GC Adapter report - delegates to mode interface
+static bool usbd_send_gc_adapter_report(uint8_t player_index)
+{
+    const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_GC_ADAPTER];
+    if (!mode || !mode->send_report) return false;
+    if (mode->is_ready && !mode->is_ready()) return false;
+
+    // Check for pending event
+    if (player_index >= USB_MAX_PLAYERS || !pending_flags[player_index]) {
+        return false;
+    }
+
+    const input_event_t* event = &pending_events[player_index];
+    pending_flags[player_index] = false;
+
+    // Apply profile
+    profile_output_t profile_out;
+    uint32_t processed_buttons = apply_usbd_profile_player(event, &profile_out, player_index);
+
+    return mode->send_report(player_index, event, &profile_out, processed_buttons);
+}
+#endif
+
+bool usbd_send_report(uint8_t player_index)
+{
+    switch (output_mode) {
+        case USB_OUTPUT_MODE_CDC:
+            return false;  // CDC-only mode: no HID reports to send
+        case USB_OUTPUT_MODE_XBOX_ORIGINAL:
+            return usbd_send_xid_report(player_index);
+#if CFG_TUD_XINPUT
+        case USB_OUTPUT_MODE_XINPUT:
+            return usbd_send_xinput_report(player_index);
+#endif
+        case USB_OUTPUT_MODE_SWITCH:
+            return usbd_send_switch_report(player_index);
+        case USB_OUTPUT_MODE_PS3:
+            return usbd_send_ps3_report(player_index);
+        case USB_OUTPUT_MODE_PSCLASSIC:
+            return usbd_send_psclassic_report(player_index);
+        case USB_OUTPUT_MODE_PCEMINI:
+            return usbd_send_pcemini_report(player_index);
+        case USB_OUTPUT_MODE_PS4:
+            return usbd_send_ps4_report(player_index);
+        case USB_OUTPUT_MODE_XBONE:
+            return usbd_send_xbone_report(player_index);
+        case USB_OUTPUT_MODE_XAC:
+            return usbd_send_xac_report(player_index);
+        case USB_OUTPUT_MODE_KEYBOARD_MOUSE:
+            return usbd_send_kbmouse_report(player_index);
+#if CFG_TUD_GC_ADAPTER
+        case USB_OUTPUT_MODE_GC_ADAPTER:
+            return usbd_send_gc_adapter_report(player_index);
+#endif
+        case USB_OUTPUT_MODE_HID:
+            return usbd_send_hid_report(player_index);
+
+        case USB_OUTPUT_MODE_SINPUT:
+        default:
+            return usbd_send_sinput_report(player_index);
+    }
+}
+
+// Get rumble value from USB host (for feedback to input controllers)
+static uint8_t usbd_get_rumble(void)
+{
+    switch (output_mode) {
+        case USB_OUTPUT_MODE_XBOX_ORIGINAL: {
+            // XID: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XBOX_ORIGINAL];
+            if (mode && mode->get_rumble) {
+                return mode->get_rumble();
+            }
+            return 0;
+        }
+#if CFG_TUD_XINPUT
+        case USB_OUTPUT_MODE_XINPUT: {
+            // XInput: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XINPUT];
+            if (mode && mode->get_rumble) {
+                return mode->get_rumble();
+            }
+            return 0;
+        }
+#endif
+        case USB_OUTPUT_MODE_PS3: {
+            // PS3: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS3];
+            if (mode && mode->get_rumble) {
+                return mode->get_rumble();
+            }
+            return 0;
+        }
+        case USB_OUTPUT_MODE_PS4: {
+            // PS4: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS4];
+            if (mode && mode->get_rumble) {
+                return mode->get_rumble();
+            }
+            return 0;
+        }
+#if CFG_TUD_GC_ADAPTER
+        case USB_OUTPUT_MODE_GC_ADAPTER: {
+            // GC Adapter: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_GC_ADAPTER];
+            if (mode && mode->get_rumble) {
+                return mode->get_rumble();
+            }
+            return 0;
+        }
+#endif
+        case USB_OUTPUT_MODE_SINPUT: {
+            // SInput: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_SINPUT];
+            if (mode && mode->get_rumble) {
+                return mode->get_rumble();
+            }
+            return 0;
+        }
+        default:
+            // HID/Switch modes: no standard rumble protocol
+            return 0;
+    }
+}
+
+// ============================================================================
+// OUTPUT INTERFACE
+// ============================================================================
+
+// Get feedback state with separate left/right rumble and LED data
+static bool usbd_get_feedback(output_feedback_t* fb)
+{
+    if (!fb) return false;
+
+    fb->rumble_left = 0;
+    fb->rumble_right = 0;
+    fb->led_player = 0;
+    fb->led_r = fb->led_g = fb->led_b = 0;
+    fb->dirty = false;
+
+    switch (output_mode) {
+        case USB_OUTPUT_MODE_XBOX_ORIGINAL: {
+            // XID: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XBOX_ORIGINAL];
+            if (mode && mode->get_feedback) {
+                return mode->get_feedback(fb);
+            }
+            return false;
+        }
+
+#if CFG_TUD_XINPUT
+        case USB_OUTPUT_MODE_XINPUT: {
+            // XInput: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XINPUT];
+            if (mode && mode->get_feedback) {
+                return mode->get_feedback(fb);
+            }
+            return false;
+        }
+#endif
+
+        case USB_OUTPUT_MODE_PS3: {
+            // PS3: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS3];
+            if (mode && mode->get_feedback) {
+                return mode->get_feedback(fb);
+            }
+            return false;
+        }
+
+        case USB_OUTPUT_MODE_PS4: {
+            // PS4: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS4];
+            if (mode && mode->get_feedback) {
+                return mode->get_feedback(fb);
+            }
+            return false;
+        }
+
+#if CFG_TUD_GC_ADAPTER
+        case USB_OUTPUT_MODE_GC_ADAPTER: {
+            // GC Adapter: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_GC_ADAPTER];
+            if (mode && mode->get_feedback) {
+                return mode->get_feedback(fb);
+            }
+            return false;
+        }
+#endif
+
+        case USB_OUTPUT_MODE_SINPUT: {
+            // SInput: delegate to mode interface
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_SINPUT];
+            if (mode && mode->get_feedback) {
+                return mode->get_feedback(fb);
+            }
+            return false;
+        }
+
+        default:
+            return false;
+    }
+}
+
+const OutputInterface usbd_output_interface = {
+    .name = "USB",
+    .target = OUTPUT_TARGET_USB_DEVICE,
+    .init = usbd_init,
+    .task = usbd_task,
+    .core1_task = NULL,  // Runs from core0 task - doesn't need dedicated core
+    .get_feedback = usbd_get_feedback,
+    .get_rumble = usbd_get_rumble,
+    .get_player_led = NULL,
+    .get_profile_count = NULL,
+    .get_active_profile = NULL,
+    .set_active_profile = NULL,
+    .get_profile_name = NULL,
+    .get_trigger_threshold = NULL,
+};
+
+// ============================================================================
+// TINYUSB DEVICE CALLBACKS
+// ============================================================================
+
+// ============================================================================
+// INTERFACE AND ENDPOINT NUMBERS
+// ============================================================================
+
+// Platforms with a tight endpoint/FIFO budget carry only gamepad + CDC and skip
+// the keyboard/mouse HID interfaces. This keeps composite interface numbers
+// CONTIGUOUS (gamepad=0, CDC=1,2) for every mode — without it, a mode that omits
+// keyboard/mouse (e.g. DInput) leaves a gap at interface 1,2 while CDC sits at 3,4,
+// and hosts reject the whole device. ESP32-S3 DWC2 has 4 TX FIFOs; CH32 USBHS is
+// likewise endpoint-limited and its FS-oriented descriptors enumerate cleaner lean.
+#if defined(PLATFORM_ESP32) || defined(PLATFORM_CH32)
+#define USBD_LEAN_HID_COMPOSITE 1
+#endif
+
+// Interface numbers (SInput composite: 3 HID + CDC on RP2040, 1 HID + CDC on lean)
+// HID interface numbers are defined in usbd.h (ITF_NUM_HID_GAMEPAD=0, KEYBOARD=1, MOUSE=2)
+#ifdef USBD_LEAN_HID_COMPOSITE
+// Skip keyboard+mouse so total IN endpoints stay low (gamepad + CDC notif + CDC data = 3)
+enum {
+#if CFG_TUD_CDC >= 1
+    ITF_NUM_CDC_0 = ITF_NUM_HID_GAMEPAD + 1,
+    ITF_NUM_CDC_0_DATA,
+#endif
+    ITF_NUM_TOTAL
+};
+#else
+enum {
+#if CFG_TUD_CDC >= 1
+    ITF_NUM_CDC_0 = ITF_NUM_HID_MOUSE + 1,  // CDC 0 control interface (data port)
+    ITF_NUM_CDC_0_DATA,                       // CDC 0 data interface
+#endif
+    ITF_NUM_TOTAL
+};
+#endif
+
+// Backward compatibility alias for non-composite modes
+#define ITF_NUM_HID         ITF_NUM_HID_GAMEPAD
+
+// Endpoint numbers
+#define EPNUM_HID_GAMEPAD       0x81  // Gamepad IN
+#define EPNUM_HID_GAMEPAD_OUT   0x01  // Gamepad OUT (rumble/output reports)
+#ifndef USBD_LEAN_HID_COMPOSITE
+// Keyboard/mouse endpoints only on full composite (lean builds skip these)
+#define EPNUM_HID_KEYBOARD      0x82  // Keyboard IN
+#define EPNUM_HID_MOUSE         0x83  // Mouse IN
+#endif
+
+// Backward compatibility aliases
+#define EPNUM_HID           EPNUM_HID_GAMEPAD
+#define EPNUM_HID_OUT       EPNUM_HID_GAMEPAD_OUT
+
+#if CFG_TUD_CDC >= 1
+#ifdef USBD_LEAN_HID_COMPOSITE
+// CDC endpoints shifted down (no keyboard/mouse endpoints)
+#define EPNUM_CDC_0_NOTIF   0x82
+#define EPNUM_CDC_0_OUT     0x03
+#define EPNUM_CDC_0_IN      0x83
+#else
+#define EPNUM_CDC_0_NOTIF   0x84
+#define EPNUM_CDC_0_OUT     0x05
+#define EPNUM_CDC_0_IN      0x85
+#endif
+#endif
+
+
+// ============================================================================
+// DEVICE DESCRIPTOR
+// ============================================================================
+
+// CDC-only device descriptor (serial configuration, no HID)
+static const tusb_desc_device_t desc_device_cdc = {
+    .bLength            = sizeof(tusb_desc_device_t),
+    .bDescriptorType    = TUSB_DESC_DEVICE,
+    .bcdUSB             = 0x0200,  // USB 2.0
+    .bDeviceClass       = TUSB_CLASS_MISC,
+    .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol    = MISC_PROTOCOL_IAD,
+    .bDescriptorType    = TUSB_DESC_DEVICE,
+    .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor           = USB_CDC_VID,
+    .idProduct          = USB_CDC_PID,
+    .bcdDevice          = USB_CDC_BCD,
+    .iManufacturer      = 0x01,
+    .iProduct           = 0x02,
+    .iSerialNumber      = 0x03,
+    .bNumConfigurations = 0x01
+};
+
+// HID mode device descriptor (PS3-compatible DInput)
+static const tusb_desc_device_t desc_device_hid = {
+    .bLength            = sizeof(tusb_desc_device_t),
+    .bDescriptorType    = TUSB_DESC_DEVICE,
+    .bcdUSB             = 0x0200,  // USB 2.0
+#if CFG_TUD_CDC > 0
+    // Use IAD for composite device with CDC
+    .bDeviceClass       = TUSB_CLASS_MISC,
+    .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol    = MISC_PROTOCOL_IAD,
+#else
+    .bDeviceClass       = 0x00,
+    .bDeviceSubClass    = 0x00,
+    .bDeviceProtocol    = 0x00,
+#endif
+    .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor           = USB_HID_VID,
+    .idProduct          = USB_HID_PID,
+    .bcdDevice          = USB_HID_BCD,
+    .iManufacturer      = 0x01,
+    .iProduct           = 0x02,
+    .iSerialNumber      = 0x03,
+    .bNumConfigurations = 0x01
+};
+
+uint8_t const *tud_descriptor_device_cb(void)
+{
+    switch (output_mode) {
+        case USB_OUTPUT_MODE_CDC:
+            return (uint8_t const *)&desc_device_cdc;
+        case USB_OUTPUT_MODE_SINPUT:
+            return (uint8_t const *)&sinput_device_descriptor;
+        case USB_OUTPUT_MODE_XBOX_ORIGINAL:
+            return (uint8_t const *)&xbox_og_device_descriptor;
+        case USB_OUTPUT_MODE_XINPUT:
+            return (uint8_t const *)&xinput_device_descriptor;
+        case USB_OUTPUT_MODE_SWITCH:
+            return (uint8_t const *)&switch_device_descriptor;
+        case USB_OUTPUT_MODE_PS3:
+            return (uint8_t const *)&ps3_device_descriptor;
+        case USB_OUTPUT_MODE_PSCLASSIC:
+            return (uint8_t const *)&psclassic_device_descriptor;
+        case USB_OUTPUT_MODE_PCEMINI:
+            return (uint8_t const *)&pcemini_device_descriptor;
+        case USB_OUTPUT_MODE_PS4:
+            return (uint8_t const *)&ps4_device_descriptor;
+        case USB_OUTPUT_MODE_XBONE:
+            return (uint8_t const *)&xbone_device_descriptor;
+        case USB_OUTPUT_MODE_XAC:
+            return (uint8_t const *)&xac_device_descriptor;
+        case USB_OUTPUT_MODE_KEYBOARD_MOUSE:
+            // Share SInput device descriptor (same composite USB device)
+            return (uint8_t const *)&sinput_device_descriptor;
+        case USB_OUTPUT_MODE_GC_ADAPTER:
+            return (uint8_t const *)&gc_adapter_device_descriptor;
+#if CFG_TUD_VENDOR && defined(CONFIG_JOYBUS_BRIDGE)
+        case USB_OUTPUT_MODE_GBA_LINK:
+            return (uint8_t const *)&gba_link_device_descriptor;
+#endif
+        case USB_OUTPUT_MODE_HID:
+        default:
+            return (uint8_t const *)&desc_device_hid;
+    }
+}
+
+// ============================================================================
+// CONFIGURATION DESCRIPTOR
+// ============================================================================
+
+// Compile-time descriptor fragments (always compiled, concatenated at runtime)
+
+// HID gamepad fragment (IN-only, for HID/DInput mode)
+static const uint8_t desc_frag_hid_gamepad[] = {
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID, 0, HID_ITF_PROTOCOL_NONE, sizeof(hid_report_descriptor), EPNUM_HID, CFG_TUD_HID_EP_BUFSIZE, 1),
+};
+
+// SInput HID fragments (composite: gamepad INOUT + keyboard + mouse)
+static const uint8_t desc_frag_sinput_gamepad[] = {
+    TUD_HID_INOUT_DESCRIPTOR(ITF_NUM_HID_GAMEPAD, 0, HID_ITF_PROTOCOL_NONE, sizeof(sinput_report_descriptor), EPNUM_HID_GAMEPAD_OUT, EPNUM_HID_GAMEPAD, CFG_TUD_HID_EP_BUFSIZE, 1),
+};
+#ifndef USBD_LEAN_HID_COMPOSITE
+static const uint8_t desc_frag_sinput_keyboard[] = {
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID_KEYBOARD, 0, HID_ITF_PROTOCOL_NONE, sizeof(sinput_keyboard_report_descriptor), EPNUM_HID_KEYBOARD, 16, 1),
+};
+static const uint8_t desc_frag_sinput_mouse[] = {
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID_MOUSE, 0, HID_ITF_PROTOCOL_NONE, sizeof(sinput_mouse_report_descriptor), EPNUM_HID_MOUSE, 8, 1),
+};
+#endif
+
+// CDC 0 fragment (data port - always present)
+static const uint8_t desc_frag_cdc0[] = {
+#ifdef PLATFORM_CH32
+    // CH32 runs the device at HIGH speed, where bulk endpoints MUST be 512 bytes.
+    // A 64-byte bulk endpoint is illegal at HS and makes the host's CDC composite
+    // driver fail to start — which (since it claims the whole MISC/IAD device) also
+    // orphans the HID interface. FS targets (RP2040) keep 64.
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC_0, 4, EPNUM_CDC_0_NOTIF, 8, EPNUM_CDC_0_OUT, EPNUM_CDC_0_IN, 512),
+#else
+    TUD_CDC_DESCRIPTOR(ITF_NUM_CDC_0, 4, EPNUM_CDC_0_NOTIF, 8, EPNUM_CDC_0_OUT, EPNUM_CDC_0_IN, 64),
+#endif
+};
+
+// CDC-only fragment (no HID interfaces — CDC starts at interface 0).
+// KNOWN BUG (open): on ESP32-S3 this mode enumerates far enough for the host
+// to read strings but never configures (macOS: device stuck !matched, no
+// serial port; invisible to libusb). Not the EP numbers — 0x81/0x01/0x82 and
+// the composite's proven 0x82/0x03/0x83 both fail identically. Works on
+// RP2040 (gc2eth/CONFIG_NGC). Until root-caused, don't ship ESP32 boards
+// defaulted to this mode; NUS.MODE via a paired dongle is the escape hatch.
+#define EPNUM_CDC_ONLY_NOTIF  0x82
+#define EPNUM_CDC_ONLY_OUT    0x03
+#define EPNUM_CDC_ONLY_IN     0x83
+static const uint8_t desc_frag_cdc_only[] = {
+    TUD_CDC_DESCRIPTOR(0, 4, EPNUM_CDC_ONLY_NOTIF, 8, EPNUM_CDC_ONLY_OUT, EPNUM_CDC_ONLY_IN, 64),
+};
+
+// Pure-mouse fragment (KB/Mouse mode with a mouse-only identity).
+//
+// One HID interface carrying the same mouse report descriptor the composite
+// uses, so nothing about the report path changes - only what the host is told
+// exists. No gamepad, and above all no keyboard: an enumerated keyboard that
+// never sends a keystroke is still a keyboard to macOS, which opens Keyboard
+// Setup Assistant and waits for a key press that can never arrive.
+//
+// The serial port stays. It is how the pointer is tuned and how this setting is
+// turned back off, and it is not an input device, so it does not change what the
+// machine thinks it is talking to.
+#ifndef USBD_LEAN_HID_COMPOSITE
+#define ITF_NUM_PUREMOUSE_HID   0
+#define EPNUM_PUREMOUSE_HID     0x81
+#define EPNUM_PUREMOUSE_NOTIF   0x82
+#define EPNUM_PUREMOUSE_CDC_OUT 0x03
+#define EPNUM_PUREMOUSE_CDC_IN  0x83
+
+static const uint8_t desc_frag_puremouse[] = {
+    TUD_HID_DESCRIPTOR(ITF_NUM_PUREMOUSE_HID, 0, HID_ITF_PROTOCOL_NONE,
+                       sizeof(sinput_mouse_report_descriptor), EPNUM_PUREMOUSE_HID, 8, 1),
+};
+#if CFG_TUD_CDC >= 1
+static const uint8_t desc_frag_puremouse_cdc[] = {
+    TUD_CDC_DESCRIPTOR(ITF_NUM_PUREMOUSE_HID + 1, 4, EPNUM_PUREMOUSE_NOTIF, 8,
+                       EPNUM_PUREMOUSE_CDC_OUT, EPNUM_PUREMOUSE_CDC_IN, 64),
+};
+#endif
+#endif
+
+// Max possible config descriptor sizes
+#define MAX_CONFIG_LEN_HID    (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_CDC_DESC_LEN)
+#define MAX_CONFIG_LEN_SINPUT (TUD_CONFIG_DESC_LEN + TUD_HID_INOUT_DESC_LEN + 2 * TUD_HID_DESC_LEN + TUD_CDC_DESC_LEN)
+#define MAX_CONFIG_LEN_CDC    (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN)
+#define MAX_CONFIG_LEN_PUREM  (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_CDC_DESC_LEN)
+
+// Runtime-built config descriptor buffers
+static uint8_t runtime_desc_hid[MAX_CONFIG_LEN_HID];
+static uint8_t runtime_desc_sinput[MAX_CONFIG_LEN_SINPUT];
+static uint8_t runtime_desc_cdc[MAX_CONFIG_LEN_CDC];
+#ifndef USBD_LEAN_HID_COMPOSITE
+static uint8_t runtime_desc_puremouse[MAX_CONFIG_LEN_PUREM];
+
+// Read once at descriptor-build time and cached. The USB callbacks that consult
+// it run from interrupt context, where a flash read is not something to do.
+static bool pure_mouse_active = false;
+
+bool usbd_pure_mouse_active(void) { return pure_mouse_active; }
+
+// TinyUSB indexes tud_hid_n_* by HID instance, assigned in the order the
+// interfaces appear in the config descriptor - not by interface number. The
+// mouse is the third HID interface in the composite and the only one here.
+uint8_t usbd_mouse_hid_itf(void)
+{
+    return pure_mouse_active ? 0 : ITF_NUM_HID_MOUSE;
+}
+#else
+bool usbd_pure_mouse_active(void) { return false; }
+uint8_t usbd_mouse_hid_itf(void) { return ITF_NUM_HID_GAMEPAD; }
+#endif
+
+// Helper: append fragment to buffer, return new offset
+static uint16_t append_fragment(uint8_t* buf, uint16_t offset, const uint8_t* frag, uint16_t frag_len)
+{
+    memcpy(buf + offset, frag, frag_len);
+    return offset + frag_len;
+}
+
+// Build runtime config descriptors
+// Must be called before tusb_init()
+static void build_config_descriptors(void)
+{
+    uint16_t off;
+
+    // --- HID mode descriptor ---
+    // Interfaces: 1 HID + 2 CDC (data)
+    uint8_t hid_itf_count = 1 + 2;  // HID + CDC0 (2 interfaces)
+    off = TUD_CONFIG_DESC_LEN;  // Skip header, fill later
+    off = append_fragment(runtime_desc_hid, off, desc_frag_hid_gamepad, sizeof(desc_frag_hid_gamepad));
+    off = append_fragment(runtime_desc_hid, off, desc_frag_cdc0, sizeof(desc_frag_cdc0));
+
+    // Write config header (9 bytes)
+    uint8_t hid_header[] = {
+        TUD_CONFIG_DESCRIPTOR(1, hid_itf_count, 0, off, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100)
+    };
+    memcpy(runtime_desc_hid, hid_header, TUD_CONFIG_DESC_LEN);
+
+    // --- SInput mode descriptor ---
+#ifdef USBD_LEAN_HID_COMPOSITE
+    // Lean (ESP32/CH32): gamepad only (no keyboard/mouse) to stay within EP/FIFO budget
+    uint8_t sinput_itf_count = 1 + 2;  // 1 HID + CDC0 (2 interfaces)
+    off = TUD_CONFIG_DESC_LEN;
+    off = append_fragment(runtime_desc_sinput, off, desc_frag_sinput_gamepad, sizeof(desc_frag_sinput_gamepad));
+    off = append_fragment(runtime_desc_sinput, off, desc_frag_cdc0, sizeof(desc_frag_cdc0));
+#else
+    // RP2040: full composite (gamepad + keyboard + mouse + CDC)
+    uint8_t sinput_itf_count = 3 + 2;  // 3 HID + CDC0 (2 interfaces)
+    off = TUD_CONFIG_DESC_LEN;  // Skip header
+    off = append_fragment(runtime_desc_sinput, off, desc_frag_sinput_gamepad, sizeof(desc_frag_sinput_gamepad));
+    off = append_fragment(runtime_desc_sinput, off, desc_frag_sinput_keyboard, sizeof(desc_frag_sinput_keyboard));
+    off = append_fragment(runtime_desc_sinput, off, desc_frag_sinput_mouse, sizeof(desc_frag_sinput_mouse));
+    off = append_fragment(runtime_desc_sinput, off, desc_frag_cdc0, sizeof(desc_frag_cdc0));
+#endif
+
+    // Write config header (9 bytes)
+    uint8_t sinput_header[] = {
+        TUD_CONFIG_DESCRIPTOR(1, sinput_itf_count, 0, off, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 500)
+    };
+    memcpy(runtime_desc_sinput, sinput_header, TUD_CONFIG_DESC_LEN);
+
+#ifndef USBD_LEAN_HID_COMPOSITE
+    // --- Pure-mouse descriptor (KB/Mouse mode, mouse-only identity) ---
+    pure_mouse_active = kbmouse_pure_mouse();
+
+    uint8_t purem_itf_count = 1;
+    off = TUD_CONFIG_DESC_LEN;
+    off = append_fragment(runtime_desc_puremouse, off, desc_frag_puremouse, sizeof(desc_frag_puremouse));
+#if CFG_TUD_CDC >= 1
+    purem_itf_count += 2;
+    off = append_fragment(runtime_desc_puremouse, off, desc_frag_puremouse_cdc, sizeof(desc_frag_puremouse_cdc));
+#endif
+
+    uint8_t purem_header[] = {
+        TUD_CONFIG_DESCRIPTOR(1, purem_itf_count, 0, off, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100)
+    };
+    memcpy(runtime_desc_puremouse, purem_header, TUD_CONFIG_DESC_LEN);
+#endif
+
+    // --- CDC-only mode descriptor ---
+    // Interfaces: CDC control + CDC data (no HID)
+    uint8_t cdc_itf_count = 2;
+    off = TUD_CONFIG_DESC_LEN;
+    off = append_fragment(runtime_desc_cdc, off, desc_frag_cdc_only, sizeof(desc_frag_cdc_only));
+
+    // Write config header (9 bytes)
+    uint8_t cdc_header[] = {
+        TUD_CONFIG_DESCRIPTOR(1, cdc_itf_count, 0, off, 0, 100)
+    };
+    memcpy(runtime_desc_cdc, cdc_header, TUD_CONFIG_DESC_LEN);
+}
+
+uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
+{
+    (void)index;
+    switch (output_mode) {
+        case USB_OUTPUT_MODE_CDC:
+            return runtime_desc_cdc;
+        case USB_OUTPUT_MODE_SINPUT:
+            return runtime_desc_sinput;
+        case USB_OUTPUT_MODE_XBOX_ORIGINAL:
+            return xbox_og_config_descriptor;
+        case USB_OUTPUT_MODE_XINPUT:
+            return xinput_config_descriptor;
+        case USB_OUTPUT_MODE_SWITCH:
+            return switch_config_descriptor;
+        case USB_OUTPUT_MODE_PS3:
+            return ps3_config_descriptor;
+        case USB_OUTPUT_MODE_PSCLASSIC:
+            return psclassic_config_descriptor;
+        case USB_OUTPUT_MODE_PCEMINI:
+            return pcemini_config_descriptor;
+        case USB_OUTPUT_MODE_PS4:
+            return ps4_config_descriptor;
+        case USB_OUTPUT_MODE_XBONE:
+            return xbone_config_descriptor;
+        case USB_OUTPUT_MODE_XAC:
+            return xac_config_descriptor;
+        case USB_OUTPUT_MODE_KEYBOARD_MOUSE:
+#ifndef USBD_LEAN_HID_COMPOSITE
+            // Mouse-only identity when asked for; otherwise share the SInput
+            // composite descriptor (same USB device).
+            if (pure_mouse_active) return runtime_desc_puremouse;
+#endif
+            return runtime_desc_sinput;
+        case USB_OUTPUT_MODE_GC_ADAPTER:
+            return gc_adapter_config_descriptor;
+#if CFG_TUD_VENDOR && defined(CONFIG_JOYBUS_BRIDGE)
+        case USB_OUTPUT_MODE_GBA_LINK:
+            return gba_link_config_descriptor;
+#endif
+        case USB_OUTPUT_MODE_HID:
+        default:
+            return runtime_desc_hid;
+    }
+}
+
+// USB 2.0 device qualifier — Xbox console enumeration requests this during
+// the SET_CONFIGURATION dance. Returning NULL causes a STALL which some
+// hosts tolerate but the Xbox console treats as a hard failure for XBONE
+// mode (matching GP2040-CE which always returns a valid qualifier).
+uint8_t const *tud_descriptor_device_qualifier_cb(void)
+{
+    if (output_mode == USB_OUTPUT_MODE_XBONE) {
+        return xbone_device_qualifier;
+    }
+#ifdef PLATFORM_CH32
+    // CH32 brings the USBHS device up at HIGH speed, so the host (macOS) requests
+    // the device qualifier. A NULL→STALL here is contradictory for an HS device and
+    // leaves the composite HID/CDC functions unbound (no IOHIDDevice). Mirror the
+    // active mode's device descriptor as the FS other-speed qualifier.
+    static tusb_desc_device_qualifier_t qual;
+    const tusb_desc_device_t* dev = (const tusb_desc_device_t*)tud_descriptor_device_cb();
+    qual.bLength            = sizeof(qual);
+    qual.bDescriptorType    = TUSB_DESC_DEVICE_QUALIFIER;
+    qual.bcdUSB             = dev->bcdUSB;
+    qual.bDeviceClass       = dev->bDeviceClass;
+    qual.bDeviceSubClass    = dev->bDeviceSubClass;
+    qual.bDeviceProtocol    = dev->bDeviceProtocol;
+    qual.bMaxPacketSize0    = dev->bMaxPacketSize0;
+    qual.bNumConfigurations = dev->bNumConfigurations;
+    qual.bReserved          = 0;
+    return (uint8_t const*)&qual;
+#else
+    return NULL;
+#endif
+}
+
+#ifdef PLATFORM_CH32
+// After a valid qualifier the host requests the OTHER_SPEED_CONFIGURATION. The
+// device behaves identically at FS, so report the active config descriptor.
+uint8_t const *tud_descriptor_other_speed_configuration_cb(uint8_t index)
+{
+    return tud_descriptor_configuration_cb(index);
+}
+#endif
+
+// ============================================================================
+// STRING DESCRIPTORS
+// ============================================================================
+
+// String descriptor indices
+enum {
+    STRID_LANGID = 0,
+    STRID_MANUFACTURER,
+    STRID_PRODUCT,
+    STRID_SERIAL,
+#if CFG_TUD_CDC >= 1
+    STRID_CDC_DATA,
+#endif
+    STRID_COUNT
+};
+
+uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
+{
+    (void)langid;
+
+    // Xbox OG has no string descriptors
+    if (output_mode == USB_OUTPUT_MODE_XBOX_ORIGINAL) {
+        return NULL;
+    }
+
+    // Xbox One uses custom string handling via vendor control requests
+    if (output_mode == USB_OUTPUT_MODE_XBONE) {
+        // Buffer must hold the Xbox Security Method string (~92 chars)
+        static uint16_t _xbone_str[100];
+        uint16_t xbone_chr_count = 0;
+        const char* xbone_str = NULL;
+
+        // Microsoft OS String Descriptor — Xbox console / Windows requests at index 0xEE
+        if (index == 0xEE) {
+            // "MSFT100" + bMS_VendorCode (0x20) + bPad (0x00)
+            _xbone_str[0] = (TUSB_DESC_STRING << 8) | 0x12;
+            _xbone_str[1] = 'M';
+            _xbone_str[2] = 'S';
+            _xbone_str[3] = 'F';
+            _xbone_str[4] = 'T';
+            _xbone_str[5] = '1';
+            _xbone_str[6] = '0';
+            _xbone_str[7] = '0';
+            _xbone_str[8] = 0x0020;  // vendor code 0x20, pad 0x00
+            return _xbone_str;
+        }
+
+        switch (index) {
+            case 0:  // Language ID
+                _xbone_str[1] = 0x0409;
+                xbone_chr_count = 1;
+                break;
+            case 1:  // Manufacturer
+                xbone_str = XBONE_MANUFACTURER;
+                break;
+            case 2:  // Product
+                xbone_str = XBONE_PRODUCT;
+                break;
+            case 3:  // Serial
+                xbone_str = usb_serial_str;
+                break;
+            case 4:  // Xbox Security Method — Xbox console verifies this string
+                xbone_str = xbone_security_method;
+                break;
+            default:
+                return NULL;
+        }
+
+        if (xbone_str) {
+            xbone_chr_count = strlen(xbone_str);
+            if (xbone_chr_count > 99) xbone_chr_count = 99;
+            // Cast to uint8_t to avoid sign-extension on chars >= 0x80 (e.g. © = 0xA9)
+            for (uint16_t i = 0; i < xbone_chr_count; i++) {
+                _xbone_str[1 + i] = (uint8_t)xbone_str[i];
+            }
+        }
+        _xbone_str[0] = (TUSB_DESC_STRING << 8) | (2 * xbone_chr_count + 2);
+        return _xbone_str;
+    }
+
+    // XInput strings handled separately: copyright symbol in manufacturer
+    // needs uint8_t cast, and security string (index 4) needs larger buffer
+    if (output_mode == USB_OUTPUT_MODE_XINPUT && index >= 1 && index <= 4) {
+        static uint16_t _xinput_str[96];  // Large enough for security string
+        const char* xinput_str = NULL;
+        switch (index) {
+            case 1: xinput_str = XINPUT_MANUFACTURER; break;
+            case 2: xinput_str = XINPUT_PRODUCT; break;
+            case 3: xinput_str = usb_serial_str; break;
+            case 4: xinput_str = XINPUT_SECURITY_STRING; break;
+        }
+        uint8_t xinput_len = strlen(xinput_str);
+        if (xinput_len > 95) xinput_len = 95;
+        for (uint8_t i = 0; i < xinput_len; i++) {
+            _xinput_str[1 + i] = (uint8_t)xinput_str[i];
+        }
+        _xinput_str[0] = (TUSB_DESC_STRING << 8) | (2 * xinput_len + 2);
+        return _xinput_str;
+    }
+
+    static uint16_t _desc_str[32];
+    const char *str = NULL;
+    uint8_t chr_count;
+
+    switch (index) {
+        case STRID_LANGID:
+            _desc_str[1] = 0x0409;  // English
+            chr_count = 1;
+            break;
+        case STRID_MANUFACTURER:
+            // Mode-specific manufacturer
+            if (output_mode == USB_OUTPUT_MODE_SINPUT ||
+                output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE) {
+                str = SINPUT_MANUFACTURER;
+            } else if (output_mode == USB_OUTPUT_MODE_XINPUT) {
+                str = XINPUT_MANUFACTURER;
+            } else if (output_mode == USB_OUTPUT_MODE_SWITCH) {
+                str = SWITCH_MANUFACTURER;
+            } else if (output_mode == USB_OUTPUT_MODE_PS3) {
+                str = PS3_MANUFACTURER;
+            } else if (output_mode == USB_OUTPUT_MODE_PSCLASSIC) {
+                str = PSCLASSIC_MANUFACTURER;
+            } else if (output_mode == USB_OUTPUT_MODE_PCEMINI) {
+                str = PCEMINI_MANUFACTURER;
+            } else if (output_mode == USB_OUTPUT_MODE_PS4) {
+                str = PS4_MANUFACTURER;
+            } else if (output_mode == USB_OUTPUT_MODE_XAC) {
+                str = XAC_MANUFACTURER;
+            } else if (output_mode == USB_OUTPUT_MODE_GC_ADAPTER) {
+                str = GC_ADAPTER_MANUFACTURER;
+#if CFG_TUD_VENDOR && defined(CONFIG_JOYBUS_BRIDGE)
+            } else if (output_mode == USB_OUTPUT_MODE_GBA_LINK) {
+                str = GBA_LINK_MANUFACTURER;
+#endif
+            } else if (output_mode == USB_OUTPUT_MODE_CDC) {
+                str = USB_CDC_MANUFACTURER;
+            } else {
+                str = USB_HID_MANUFACTURER;
+            }
+            break;
+        case STRID_PRODUCT:
+            // Mode-specific product
+#ifndef USBD_LEAN_HID_COMPOSITE
+            if (output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE && pure_mouse_active) {
+                // Say what it is. This is the name that shows up in System
+                // Information and in any dialog the host decides to raise.
+                str = "Joypad Mouse";
+            } else
+#endif
+            if (output_mode == USB_OUTPUT_MODE_SINPUT ||
+                output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE) {
+                str = SINPUT_PRODUCT;
+            } else if (output_mode == USB_OUTPUT_MODE_XINPUT) {
+                str = XINPUT_PRODUCT;
+            } else if (output_mode == USB_OUTPUT_MODE_SWITCH) {
+                str = SWITCH_PRODUCT;
+            } else if (output_mode == USB_OUTPUT_MODE_PS3) {
+                str = PS3_PRODUCT;
+            } else if (output_mode == USB_OUTPUT_MODE_PSCLASSIC) {
+                str = PSCLASSIC_PRODUCT;
+            } else if (output_mode == USB_OUTPUT_MODE_PCEMINI) {
+                str = PCEMINI_PRODUCT;
+            } else if (output_mode == USB_OUTPUT_MODE_PS4) {
+                str = PS4_PRODUCT;
+            } else if (output_mode == USB_OUTPUT_MODE_XAC) {
+                str = XAC_PRODUCT;
+            } else if (output_mode == USB_OUTPUT_MODE_GC_ADAPTER) {
+                str = GC_ADAPTER_PRODUCT;
+#if CFG_TUD_VENDOR && defined(CONFIG_JOYBUS_BRIDGE)
+            } else if (output_mode == USB_OUTPUT_MODE_GBA_LINK) {
+                str = GBA_LINK_PRODUCT;
+#endif
+            } else if (output_mode == USB_OUTPUT_MODE_CDC) {
+                str = USB_CDC_PRODUCT;
+            } else {
+                str = USB_HID_PRODUCT;
+            }
+            break;
+        case STRID_SERIAL:
+            str = usb_serial_str;  // Dynamic from board unique ID
+            break;
+#if CFG_TUD_CDC >= 1
+        case STRID_CDC_DATA:
+            str = "Joypad Data";
+            break;
+#endif
+        default:
+            return NULL;
+    }
+
+    if (str) {
+        chr_count = strlen(str);
+        if (chr_count > 31) chr_count = 31;
+        for (uint8_t i = 0; i < chr_count; i++) {
+            _desc_str[1 + i] = str[i];
+        }
+    }
+
+    // First byte is length (in bytes), second byte is descriptor type
+    _desc_str[0] = (TUSB_DESC_STRING << 8) | (2 * chr_count + 2);
+    return _desc_str;
+}
+
+// HID Callbacks
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t itf)
+{
+#ifndef USBD_LEAN_HID_COMPOSITE
+    // Pure-mouse identity: the single HID interface is the mouse.
+    if (output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE && pure_mouse_active) {
+        return sinput_mouse_report_descriptor;
+    }
+#endif
+
+    // SInput and KB/Mouse modes: route by interface (composite device)
+    if (output_mode == USB_OUTPUT_MODE_SINPUT ||
+        output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE) {
+        switch (itf) {
+            case ITF_NUM_HID_GAMEPAD:  return sinput_report_descriptor;
+            case ITF_NUM_HID_KEYBOARD: return sinput_keyboard_report_descriptor;
+            case ITF_NUM_HID_MOUSE:    return sinput_mouse_report_descriptor;
+            default:                   return sinput_report_descriptor;
+        }
+    }
+
+    // All other modes: single HID interface (itf is always 0)
+    if (output_mode == USB_OUTPUT_MODE_SWITCH) {
+        return switch_report_descriptor;
+    }
+    if (output_mode == USB_OUTPUT_MODE_PS3) {
+        return ps3_report_descriptor;
+    }
+    if (output_mode == USB_OUTPUT_MODE_PSCLASSIC) {
+        return psclassic_report_descriptor;
+    }
+    if (output_mode == USB_OUTPUT_MODE_PCEMINI) {
+        return pcemini_report_descriptor;
+    }
+    if (output_mode == USB_OUTPUT_MODE_PS4) {
+        return ps4_report_descriptor;
+    }
+    if (output_mode == USB_OUTPUT_MODE_XAC) {
+        const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XAC];
+        if (mode && mode->get_report_descriptor) {
+            return mode->get_report_descriptor();
+        }
+    }
+#if CFG_TUD_GC_ADAPTER
+    if (output_mode == USB_OUTPUT_MODE_GC_ADAPTER) {
+        const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_GC_ADAPTER];
+        if (mode && mode->get_report_descriptor) {
+            return mode->get_report_descriptor();
+        }
+    }
+#endif
+    return hid_report_descriptor;
+}
+
+uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen)
+{
+#ifndef USBD_LEAN_HID_COMPOSITE
+    // Pure-mouse identity: interface 0 is the mouse, not the gamepad, so it must
+    // not fall through to the gamepad's input-report reply below.
+    if (output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE && pure_mouse_active) {
+        return 0;
+    }
+#endif
+
+    // SInput/KB/Mouse composite: route by interface
+    if ((output_mode == USB_OUTPUT_MODE_SINPUT ||
+         output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE) &&
+        itf != ITF_NUM_HID_GAMEPAD) {
+        // Keyboard/mouse interfaces don't have get_report handlers
+        return 0;
+    }
+
+    // PS3 feature reports: delegate to mode interface
+    if (output_mode == USB_OUTPUT_MODE_PS3) {
+        const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS3];
+        if (mode && mode->get_report) {
+            uint16_t result = mode->get_report(report_id, report_type, buffer, reqlen);
+            if (result > 0) return result;
+        }
+    }
+
+    // PS4 feature reports: delegate to mode interface
+    if (output_mode == USB_OUTPUT_MODE_PS4) {
+        const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS4];
+        if (mode && mode->get_report) {
+            uint16_t result = mode->get_report(report_id, report_type, buffer, reqlen);
+            if (result > 0) return result;
+        }
+    }
+
+    // Default: return current input report
+    (void)report_id;
+    (void)report_type;
+    uint16_t len = sizeof(joypad_hid_report_t);
+    if (reqlen < len) len = reqlen;
+    memcpy(buffer, &hid_report, len);
+    return len;
+}
+
+// Weak default for app_on_console_shutdown(). Apps that need to react to a
+// host "turn off controller" command (currently only PS3) override this --
+// see src/apps/bt2usb/app.c for the BT-disconnect handler.
+__attribute__((weak)) void app_on_console_shutdown(void)
+{
+}
+
+void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize)
+{
+    printf("[usbd] set_report_cb: itf=%d report_id=0x%02x type=%d len=%d mode=%d\n",
+           itf, report_id, report_type, bufsize, output_mode);
+
+#ifndef USBD_LEAN_HID_COMPOSITE
+    // Pure-mouse identity: the only HID interface is the mouse, which has no
+    // output reports. Nothing to route.
+    if (output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE && pure_mouse_active) {
+        return;
+    }
+#endif
+
+    // SInput/KB/Mouse composite: route by interface
+    if (output_mode == USB_OUTPUT_MODE_SINPUT ||
+        output_mode == USB_OUTPUT_MODE_KEYBOARD_MOUSE) {
+        if (itf == ITF_NUM_HID_GAMEPAD) {
+            // Gamepad output report (rumble, LEDs) → SInput handler
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_SINPUT];
+            if (mode && mode->handle_output) {
+                mode->handle_output(report_id, buffer, bufsize);
+            }
+            return;
+        }
+        if (itf == ITF_NUM_HID_KEYBOARD) {
+            // Keyboard LED output report → KB/Mouse handler
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_KEYBOARD_MOUSE];
+            if (mode && mode->handle_output) {
+                mode->handle_output(report_id, buffer, bufsize);
+            }
+            return;
+        }
+        // Mouse interface has no output reports
+        return;
+    }
+
+    // PS3 output/feature reports: delegate to mode interface
+    if (output_mode == USB_OUTPUT_MODE_PS3) {
+        const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS3];
+        if (mode && mode->handle_output) {
+            mode->handle_output(report_id, buffer, bufsize);
+        }
+        // Also handle feature reports for auth handshake
+        if (report_type == HID_REPORT_TYPE_FEATURE) {
+            ps3_mode_set_feature_report(report_id, buffer, bufsize);
+        }
+        return;
+    }
+
+    // PS4 output report: delegate to mode interface
+    if (output_mode == USB_OUTPUT_MODE_PS4) {
+        const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_PS4];
+        if (mode && mode->handle_output) {
+            mode->handle_output(report_id, buffer, bufsize);
+        }
+        // Also handle feature reports for auth
+        if (report_type == HID_REPORT_TYPE_FEATURE) {
+            ps4_mode_set_feature_report(report_id, buffer, bufsize);
+        }
+        return;
+    }
+
+#if CFG_TUD_GC_ADAPTER
+    // GC Adapter output reports - delegate to mode interface
+    if (output_mode == USB_OUTPUT_MODE_GC_ADAPTER) {
+        const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_GC_ADAPTER];
+        if (mode && mode->handle_output) {
+            mode->handle_output(report_id, buffer, bufsize);
+            return;
+        }
+    }
+#endif
+
+    (void)report_id;
+    (void)buffer;
+    (void)bufsize;
+}
+
+// ============================================================================
+// CUSTOM CLASS DRIVER REGISTRATION
+// ============================================================================
+
+// Register custom class drivers for vendor-specific modes
+usbd_class_driver_t const* usbd_app_driver_get_cb(uint8_t* driver_count)
+{
+    switch (output_mode) {
+        case USB_OUTPUT_MODE_XBOX_ORIGINAL: {
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XBOX_ORIGINAL];
+            if (mode && mode->get_class_driver) {
+                *driver_count = 1;
+                return mode->get_class_driver();
+            }
+            *driver_count = 0;
+            return NULL;
+        }
+
+#if CFG_TUD_XINPUT
+        case USB_OUTPUT_MODE_XINPUT:
+            *driver_count = 1;
+            return tud_xinput_class_driver();
+#endif
+
+        case USB_OUTPUT_MODE_XBONE: {
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_XBONE];
+            if (mode && mode->get_class_driver) {
+                *driver_count = 1;
+                return mode->get_class_driver();
+            }
+            *driver_count = 0;
+            return NULL;
+        }
+
+#if CFG_TUD_GC_ADAPTER
+        case USB_OUTPUT_MODE_GC_ADAPTER: {
+            const usbd_mode_t* mode = usbd_modes[USB_OUTPUT_MODE_GC_ADAPTER];
+            if (mode && mode->get_class_driver) {
+                *driver_count = 1;
+                return mode->get_class_driver();
+            }
+            *driver_count = 0;
+            return NULL;
+        }
+#endif
+
+        default:
+            // HID/Switch modes use built-in HID class driver
+            *driver_count = 0;
+            return NULL;
+    }
+}
+
+// Vendor control request callback (for Xbox One Windows OS descriptors)
+bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
+                                 tusb_control_request_t const* request)
+{
+    if (output_mode == USB_OUTPUT_MODE_XBONE) {
+        return tud_xbone_vendor_control_xfer_cb(rhport, stage, request);
+    }
+    if (output_mode == USB_OUTPUT_MODE_XINPUT) {
+        return tud_xinput_vendor_control_xfer_cb(rhport, stage, request);
+    }
+#if CFG_TUD_XID
+    if (output_mode == USB_OUTPUT_MODE_XBOX_ORIGINAL) {
+        // TinyUSB short-circuits ALL vendor-type control requests to this
+        // callback (device/usbd.c process_control_request), bypassing the class
+        // driver. The XID protocol's GET_DESC (0xC1/0x06/wValue=0x4200) and
+        // GET_CAP (0xC1/0x01) requests are vendor-type, so they never reach the
+        // XID class driver on their own. Forward them explicitly or the real
+        // Xbox can't read the XID descriptor during enumeration and rejects the
+        // controller. Mirrors OGX-Mini's tud_callbacks.cpp dispatch.
+        return tud_xid_class_driver()->control_xfer_cb(rhport, stage, request);
+    }
+#endif
+    return true;  // Accept by default for other modes
+}

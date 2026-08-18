@@ -1,0 +1,21 @@
+treadmill-mouse
+Copyright 2026 the treadmill-mouse contributors
+
+This product includes software developed as part of Joypad / joypad-os:
+
+  joypad-os
+  Copyright Robert Dale Smith and the joypad-os contributors
+  https://github.com/joypad-ai/joypad-os
+  Licensed under the Apache License, Version 2.0
+
+The files under overlay/ are modifications of, or additions to, that project
+and remain under the Apache License, Version 2.0. Each carries its upstream
+provenance in its own header where one was present.
+
+joypad-os in turn vendors third-party components under their own licences; see
+THIRD_PARTY_LICENSES in that repository. None of them are redistributed here —
+setup.sh fetches them from their own upstreams.
+
+"Joypad", "USB2PCE", "GCUSB" and "USB2GC" are trademarks of Robert Dale Smith.
+This project is not affiliated with, endorsed by, or sponsored by the joypad-os
+project, and does not use those marks as its own name or branding.
