@@ -16,6 +16,18 @@ held in mid-air by someone whose body is moving. Everything else here followed
 from wanting a cursor while walking, on whatever computer happened to be in
 front of the treadmill.
 
+That is also why it works on a work computer. No driver, no installer, no
+admin password, no accessibility permission, nothing for IT to approve —
+every operating system has shipped support for a USB mouse for thirty years,
+and this is a USB mouse. A managed laptop that would block a mapping app the
+moment you tried to run it treats this the same way it treats the mouse
+already on the desk. It has been plugged into one and it worked.
+
+The one prompt you may see is macOS's own "Allow accessory to connect?", which
+Apple Silicon shows for any new USB device and no firmware can suppress. It is
+a single click and needs no password. Turning on the mouse-only identity below
+gets rid of the other one.
+
 The firmware is a patched build of [joypad-os](https://github.com/joypad-ai/joypad-os),
 running on a Raspberry Pi Pico 2 W. This repository holds the changes, the
 configuration page, and the test tools.
